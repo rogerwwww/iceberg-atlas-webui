@@ -373,14 +373,3 @@ sudo /path/to/environment/bin/python webui/deploy/install_webdav.py \
 `--check` validates configuration without installing it. `--apply` records a
 backup under `/var/backups/iceberg-webdav/`; use `--rollback BACKUP_DIRECTORY` to
 restore it. Keep the same accounts file and role settings across all services.
-
-## Migrating an existing deployment
-
-This extraction changes local source files only. To migrate a server, install
-this checkout and its dependencies, update all three systemd `WorkingDirectory`
-and `ExecStart` paths, and preserve the existing environment files, systemd
-overrides, signing secret, users YAML, analytics database, SFTP host key, and
-WebDAV session token. Copying a service template does not copy active overrides.
-Use absolute atlas/runtime paths; the atlas and research results stay in place.
-After an intentional service restart, verify the homepage, login, file browsing,
-role-gated NIST access, and any enabled SFTP/WebDAV endpoints.
