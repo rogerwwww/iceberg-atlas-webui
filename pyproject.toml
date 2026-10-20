@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iceberg-atlas-webui"
+version = "0.1.0"
+description = "ICEBERG Atlas spectrum retrieval, visualization, and read-only file services"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "ms_pred", "numpy>=2", "rdkit==2025.03.*", "pyyaml", "pubchempy>=1.0",
+    "flask>=3.0", "flask-login>=0.6", "werkzeug>=3.0", "gunicorn>=21.0",
+    "geoip2>=4.0", "asyncssh>=2.14,<2.24", "WsgiDAV>=4.3.5,<5",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+studies = ["pillow"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["webui", "webui.deploy"]
+
+[tool.setuptools.package-data]
+webui = ["templates/*.html", "static/*", "examples/*.ms", "deploy/*.service", "deploy/*.conf"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

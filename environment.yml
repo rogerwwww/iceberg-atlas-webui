@@ -1,0 +1,22 @@
+name: iceberg-atlas-webui
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Web service dependencies; install the ms_pred backend as described in README.md.
+  - python=3.12
+  - numpy>=2
+  - rdkit=2025.03
+  - pyyaml
+  - pillow
+  - pytest>=8
+  - pip
+  - pip:
+    - flask>=3.0
+    - flask-login>=0.6
+    - werkzeug>=3.0
+    - pubchempy>=1.0
+    - gunicorn>=21.0
+    - geoip2>=4.0
+    - asyncssh>=2.14,<2.24
+    - WsgiDAV>=4.3.5,<5

@@ -1,0 +1,3394 @@
+#!/usr/bin/env python3
+from io import BytesIO
+from pathlib import Path
+from typing import List, Dict, Any, Sequence, Tuple, Optional
+import threading
+import time
+import tempfile
+import uuid
+import os
+import json
+import secrets
+import string
+import sys
+import smtplib
+import sqlite3
+import ipaddress
+import functools
+from datetime import datetime, timezone, timedelta
+from email.message import EmailMessage
+from dataclasses import dataclass, field
+from http.client import RemoteDisconnected
+from urllib.error import URLError
+
+from flask import Flask, render_template, request, send_file, flash, redirect, url_for, abort, jsonify, Response, stream_with_context, get_flashed_messages
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.security import generate_password_hash, check_password_hash
+import numpy as np
+import pubchempy as pcp
+import yaml
+
+try:
+    from .vfs import AtlasVirtualFS, VfsError, normalize_virtual_path
+    from .webdav_session import register_session_auth
+except ImportError:  # pragma: no cover - direct execution from webui/
+    from vfs import AtlasVirtualFS, VfsError, normalize_virtual_path
+    from webdav_session import register_session_auth
+
+from ms_pred import common
+from ms_pred.common import MassSpec, CompositeMassSpec
+import ms_pred.magma.fragmentation as fragmentation
+
+# RDKit imports
+from rdkit import Chem
+from rdkit.Chem import Draw, rdMolDescriptors
+from rdkit.Chem.Draw import rdMolDraw2D
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+BASE_MGF_DIR = Path(os.environ.get("MSPRED_ATLAS_DIR", "/home/coley-group/atlas/"))
+ADDUCT_TO_DIR = {
+    '[M+H]+': BASE_MGF_DIR / 'h_plus_out_mgf',
+    '[M-H]-': BASE_MGF_DIR / 'h_minus_out_mgf',
+    '[M]+': BASE_MGF_DIR / 'm_plus_out_mgf',
+}
+
+# NIST'23 atlas (gated — only authenticated internal users see it)
+_NIST_DIR_ENV = os.environ.get("MSPRED_ATLAS_DIR_NIST", "")
+NIST_MGF_DIR: Path | None = Path(_NIST_DIR_ENV) if _NIST_DIR_ENV else None
+NIST_ADDUCT_TO_DIR = (
+    {
+        '[M+H]+': NIST_MGF_DIR / 'h_plus_out_mgf',
+        '[M-H]-': NIST_MGF_DIR / 'h_minus_out_mgf',
+        '[M]+': NIST_MGF_DIR / 'm_plus_out_mgf',
+    }
+    if NIST_MGF_DIR is not None
+    else {}
+)
+
+# Internal-user store (YAML file: email -> nested record with password hash + role)
+ICEBERG_USERS_FILE: Path | None = (
+    Path(os.environ["ICEBERG_USERS_FILE"])
+    if "ICEBERG_USERS_FILE" in os.environ
+    else None
+)
+
+# Comma-separated list of emails that always have admin privilege (safety net)
+_ADMIN_EMAILS_ENV: set = {
+    e.strip().lower()
+    for e in os.environ.get("ICEBERG_ADMIN_EMAILS", "").split(",")
+    if e.strip()
+}
+
+# SMTP config for sending registration emails (optional; if unset, email is skipped).
+_SMTP_HOST: str = os.environ.get("SMTP_HOST", "")
+_SMTP_PORT: int = int(os.environ.get("SMTP_PORT", "587"))
+_SMTP_USER: str = os.environ.get("SMTP_USER", "")
+_SMTP_PASSWORD: str = os.environ.get("SMTP_PASSWORD", "")
+_SMTP_FROM: str = os.environ.get("SMTP_FROM", _SMTP_USER)
+_SMTP_USE_TLS: bool = os.environ.get("SMTP_USE_TLS", "true").lower() not in ("0", "false", "no")
+# Contact address shown in outgoing emails and the atlas header — defaults to SMTP_FROM if unset
+_CONTACT_EMAIL: str = os.environ.get("ICEBERG_CONTACT_EMAIL", _SMTP_FROM)
+# Full email templates for credential emails.  Placeholders: {email}, {password}, {contact}.
+# Use \n for newlines when setting via an environment variable.
+# Defaults are intentionally generic — open-source adopters should override these.
+_EMAIL_SUBJECT_NEW: str = os.environ.get(
+    "ICEBERG_EMAIL_SUBJECT_NEW",
+    "Access to the ICEBERG Mass Spectrometry Atlas",
+)
+_EMAIL_BODY_NEW: str = os.environ.get("ICEBERG_EMAIL_BODY_NEW", "").replace("\\n", "\n") or (
+    "Hello,\n\n"
+    "You have been granted access to the ICEBERG Mass Spectrometry Atlas,\n"
+    "a tool for exploring predicted MS2 spectra.\n\n"
+    "Username:    {email}\n"
+    "Password:    {password}\n\n"
+    "Please log in and use the \"Change password\" link to set your own password.\n\n"
+    "If you have any questions, please reach out to {contact}.\n"
+)
+_EMAIL_SUBJECT_RESET: str = os.environ.get(
+    "ICEBERG_EMAIL_SUBJECT_RESET",
+    "ICEBERG Mass Spectrometry Atlas — password reset",
+)
+_EMAIL_BODY_RESET: str = os.environ.get("ICEBERG_EMAIL_BODY_RESET", "").replace("\\n", "\n") or (
+    "Hello,\n\n"
+    "Your password for the ICEBERG Mass Spectrometry Atlas has been reset by an\n"
+    "administrator. Your new temporary login credentials are below.\n\n"
+    "Username:    {email}\n"
+    "Password:    {password}\n\n"
+    "Please log in and use the \"Change password\" link to set your own password.\n\n"
+    "If you have any questions, please reach out to {contact}.\n"
+)
+
+# SQLite analytics database
+_ANALYTICS_DB_PATH: Path | None = (
+    Path(os.environ["ICEBERG_ANALYTICS_DB"])
+    if "ICEBERG_ANALYTICS_DB" in os.environ
+    else (ICEBERG_USERS_FILE.parent / "analytics.db" if ICEBERG_USERS_FILE else None)
+)
+_analytics_db_lock = threading.Lock()
+
+# MaxMind GeoLite2 database for geo-IP resolution (optional)
+_GEOIP_DB_PATH: str = os.environ.get("GEOIP_DB", "")
+
+# Example spectrum
+EXAMPLE_MS_PATH = (
+    Path(__file__).resolve().parent / "examples/lpc19-0_standard.ms"
+)
+
+# Collision energy matching tolerance (in eV)
+EV_TOLERANCE = 1.0
+
+# -----------------------------------------------------------------------------
+# Utility functions
+# -----------------------------------------------------------------------------
+
+
+def round_ev(ev: Any) -> int:
+    """Round a collision-energy value to the nearest integer eV."""
+    return int(round(float(ev)))
+
+
+def get_formula_subdir(formula: str, adduct='[M+H]+') -> Path:
+    """
+    Wrapper around common.get_formula_subdir to return a Path (public atlas).
+    """
+    subdir = common.get_formula_subdir(formula)
+    return ADDUCT_TO_DIR[adduct] / subdir
+
+
+def get_mgf_path_for_formula(formula: str, adduct='[M+H]+') -> Path:
+    """
+    Get the .mgf path for a given chemical formula (public atlas only).
+    """
+    subdir = get_formula_subdir(formula, adduct)
+    mgf_path = subdir / f"{formula}.mgf"
+    return mgf_path
+
+
+def mgf_paths_for_formula(
+    formula: str,
+    adduct: str = '[M+H]+',
+    include_nist: bool = False,
+) -> List[Path]:
+    """
+    Return ordered list of existing .mgf paths for a formula.
+    Public atlas is always first; NIST atlas is appended when include_nist=True
+    and MSPRED_ATLAS_DIR_NIST is configured.
+    """
+    paths: List[Path] = []
+
+    pub_path = get_mgf_path_for_formula(formula, adduct)
+    if pub_path.exists():
+        paths.append(pub_path)
+
+    if include_nist and NIST_MGF_DIR is not None and adduct in NIST_ADDUCT_TO_DIR:
+        nist_subdir = common.get_formula_subdir(formula)
+        nist_path = NIST_ADDUCT_TO_DIR[adduct] / nist_subdir / f"{formula}.mgf"
+        if nist_path.exists():
+            paths.append(nist_path)
+
+    return paths
+
+
+def parse_user_spectrum(text: str) -> np.ndarray:
+    """
+    Parse pasted spectrum text into an (N, 2) numpy array: [m/z, intensity].
+    Lines must be 'mz intensity'.
+    """
+    mz_int_list = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            mz = float(parts[0])
+            inten = float(parts[1])
+        except ValueError:
+            # ignore malformed/non-numeric lines
+            continue
+        mz_int_list.append((mz, inten))
+
+    if not mz_int_list:
+        raise ValueError("No valid peaks found in the pasted spectrum.")
+
+    arr = np.array(mz_int_list, dtype=float)
+    return arr
+
+
+def prepare_user_spectra(
+    formula: str,
+    adduct: str,
+    texts: List[str],
+    nces: List[str],
+) -> CompositeMassSpec:
+    """
+    Parse user spectra texts, compute precursor m/z from formula + adduct,
+    convert NCE to eV using common.nce_to_ev, and return a mapping:
+    {ev_value: MassSpec}.
+    """
+    precursor_mz = common.formula_mass(formula) + common.ion2mass[adduct]
+
+    all_specs: List[MassSpec] = []
+
+    for spec_text, nce in zip(texts, nces):
+        spec_text = spec_text.strip()
+        nce = nce.strip()
+        if not spec_text or not nce:
+            continue
+
+        peaks = parse_user_spectrum(spec_text)
+        masses = peaks[:, 0]
+        intens = peaks[:, 1]
+
+        ev_value = round_ev(common.nce_to_ev(nce, precursor_mz))
+
+        spec_obj = MassSpec(
+            collision_energy=ev_value,
+            root_canonical_smiles=None,
+            adduct=adduct,
+            remark="User query",
+            masses=masses,
+            intens=intens,
+        )
+        # Cache the original NCE on the MassSpec so we never have to
+        # recompute it from eV later.
+        try:
+            spec_obj.nce = float(nce)
+        except Exception:
+            pass
+        all_specs.append(spec_obj)
+
+    if not all_specs:
+        raise ValueError("No valid user spectra were provided.")
+
+    ev_to_spec = CompositeMassSpec(all_specs)
+    return ev_to_spec
+
+
+def smiles_to_lookup_keys(smiles: str) -> Dict[str, str]:
+    """
+    Parse a SMILES string and return canonical SMILES, molecular formula,
+    and InChIKey for atlas lookup.
+
+    Canonicalization matches what joint_model.predict_mol does when building
+    the atlas: SMILES -> InChI -> tautomer-canonical SMILES (via
+    common.smiles_from_inchi). Without this round-trip, tautomer-equivalent
+    user input misses atlas entries whose InChIKey was computed post-canon.
+    """
+    raw_mol = Chem.MolFromSmiles(smiles)
+    if raw_mol is None:
+        raise ValueError("Invalid SMILES")
+
+    inchi = common.inchi_from_smiles(smiles)
+    canonical_smiles = common.smiles_from_inchi(inchi) if inchi else ""
+    if not canonical_smiles:
+        canonical_smiles = Chem.MolToSmiles(raw_mol)
+    canon_mol = Chem.MolFromSmiles(canonical_smiles) or raw_mol
+
+    return {
+        "canonical_smiles": canonical_smiles,
+        "formula": common.uncharged_formula(canon_mol, mol_type="mol"),
+        "inchikey": Chem.MolToInchiKey(canon_mol),
+    }
+
+
+def _canonicalize_smiles_safe(smi: str) -> str:
+    if not smi:
+        return ""
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return ""
+    return Chem.MolToSmiles(mol)
+
+
+def _load_mgf_index(mgf_path: Path) -> Dict[str, List[List[int]]] | None:
+    """
+    Load the .idx sidecar for an MGF file, or return None if absent/unreadable.
+    The sidecar is produced by run_scripts/iceberg_atlas/04_build_index.py and
+    has the shape: { "<INCHIKEY>": [[byte_offset, block_length], ...], ... }.
+    """
+    idx_path = mgf_path.with_suffix(".mgf.idx")
+    if not idx_path.exists():
+        return None
+    try:
+        with open(idx_path, "r") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _parse_mgf_block_text(text: str) -> Tuple[Dict[str, str], np.ndarray] | Tuple[None, None]:
+    """
+    Parse a single BEGIN IONS … END IONS text chunk into (meta, peaks).
+    Shared by the full-scan and the indexed reader so the parsing logic
+    lives in exactly one place.
+    """
+    meta: Dict[str, str] = {}
+    peaks: List[Tuple[float, float]] = []
+    in_block = False
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line == "BEGIN IONS":
+            in_block = True
+            continue
+        if line == "END IONS":
+            break
+        if not in_block:
+            continue
+        if "=" in line and not line[0].isdigit():
+            k, _, v = line.partition("=")
+            meta[k] = v
+        else:
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    peaks.append((float(parts[0]), float(parts[1])))
+                except ValueError:
+                    pass
+
+    if not peaks:
+        return None, None
+    return meta, np.asarray(peaks, dtype=float)
+
+
+def inchikey_in_mgf(mgf_path: Path, inchikey: str) -> bool:
+    """
+    Cheap existence check.  When an .idx sidecar is present, this is O(1)
+    (key lookup in the loaded JSON).  Falls back to a full line-scan otherwise.
+
+    Matches on the 2D connectivity layer only (first 14 chars of the InChIKey)
+    so that stereo-unspecified queries find stereo-specific atlas entries.
+    """
+    if not inchikey:
+        return False
+
+    prefix = inchikey[:14]
+    idx = _load_mgf_index(mgf_path)
+    if idx is not None:
+        return any(k.startswith(prefix) for k in idx)
+
+    needle_prefix = f"INCHIKEY={prefix}"
+    try:
+        with open(mgf_path, "r") as f:
+            for line in f:
+                if line.rstrip().startswith(needle_prefix):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def extract_mgf_blocks_by_inchikey(
+    mgf_path: Path, inchikey: str
+) -> List[Tuple[Dict[str, str], np.ndarray]]:
+    """
+    Retrieve all MGF blocks for `inchikey` from `mgf_path`.
+
+    Fast path: if a .idx sidecar exists, seeks directly to each block's byte
+    range (O(1) per block) instead of scanning the whole file.
+    Fallback: full single-pass line scan when no sidecar is available.
+
+    Matches on the 2D connectivity layer only (first 14 chars of the InChIKey)
+    so that stereo-unspecified queries find stereo-specific atlas entries.
+    """
+    prefix = inchikey[:14]
+
+    # ---- indexed fast path --------------------------------------------------
+    idx = _load_mgf_index(mgf_path)
+    if idx is not None:
+        all_ranges = []
+        for k, v in idx.items():
+            if k.startswith(prefix):
+                all_ranges.extend(v)
+        if not all_ranges:
+            return []
+        blocks: List[Tuple[Dict[str, str], np.ndarray]] = []
+        try:
+            with open(mgf_path, "rb") as f:
+                for offset, length in all_ranges:
+                    f.seek(offset)
+                    chunk = f.read(length).decode("utf-8", errors="replace")
+                    meta, peaks = _parse_mgf_block_text(chunk)
+                    if meta is not None and peaks is not None:
+                        blocks.append((meta, peaks))
+        except OSError:
+            pass
+        return blocks
+
+    # ---- full-scan fallback -------------------------------------------------
+    needle_prefix = f"INCHIKEY={prefix}"
+    blocks_scan: List[Tuple[Dict[str, str], np.ndarray]] = []
+
+    in_block = False
+    meta: Dict[str, str] = {}
+    peaks: List[Tuple[float, float]] = []
+    matches = False
+
+    with open(mgf_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line == "BEGIN IONS":
+                in_block = True
+                meta = {}
+                peaks = []
+                matches = False
+                continue
+            if line == "END IONS":
+                if matches and peaks:
+                    blocks_scan.append((meta, np.asarray(peaks, dtype=float)))
+                in_block = False
+                continue
+            if not in_block:
+                continue
+            if "=" in line and not line[0].isdigit():
+                k, _, v = line.partition("=")
+                meta[k] = v
+                if line.startswith(needle_prefix):
+                    matches = True
+                continue
+            # peak row
+            if matches:
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        peaks.append((float(parts[0]), float(parts[1])))
+                    except ValueError:
+                        pass
+
+    return blocks_scan
+
+
+def build_composite_from_blocks(
+    blocks: List[Tuple[Dict[str, str], np.ndarray]]
+) -> Tuple[Dict[str, Any], CompositeMassSpec] | Tuple[None, None]:
+    """
+    Convert raw (meta, peaks) blocks for a single structure into
+    (representative_meta, CompositeMassSpec). Mirrors the per-block
+    logic of load_library_spectra_grouped but skips the grouping step
+    since all blocks already share the same structure.
+    """
+    if not blocks:
+        return None, None
+
+    specs: List[MassSpec] = []
+    rep_meta: Dict[str, Any] = {}
+
+    for meta, peaks in blocks:
+        if len(peaks) == 0:
+            continue
+        ce_str = meta.get("COLLISION_ENERGY")
+        if ce_str is None:
+            continue
+        try:
+            ce_val = round_ev(ce_str)
+        except ValueError:
+            continue
+
+        masses = peaks[:, 0]
+        intens = peaks[:, 1]
+
+        frags_raw = meta.get("FRAGS")
+        int_frags = None
+        if frags_raw is not None:
+            try:
+                frag_tokens = [
+                    tok for tok in frags_raw.replace(",", " ").split() if tok
+                ]
+                frags = [int(tok) for tok in frag_tokens]
+                if len(frags) == len(masses):
+                    int_frags = np.asarray(frags, dtype=int)
+            except Exception:
+                int_frags = None
+
+        ms = MassSpec(
+            collision_energy=ce_val,
+            root_canonical_smiles=meta.get("SMILES"),
+            adduct=meta.get("ADDUCT"),
+            remark=meta.get("DESCRIPTION"),
+            masses=masses,
+            intens=intens,
+            int_frags=int_frags,
+            **{
+                k: v
+                for k, v in meta.items()
+                if k not in ["SMILES", "ADDUCT", "DESCRIPTION", "COLLISION_ENERGY"]
+            },
+        )
+        specs.append(ms)
+
+        if not rep_meta:
+            rep_meta = dict(meta)
+            rep_meta.pop("COLLISION_ENERGY", None)
+
+    if not specs:
+        return None, None
+    return rep_meta, CompositeMassSpec(specs)
+
+
+def find_structure_in_library(
+    grouped: Dict[str, Dict[str, Any]],
+    inchikey: str,
+    canonical_smiles: str,
+) -> Dict[str, Any] | None:
+    """
+    Locate a structure in a grouped library dict by InChIKey (preferred)
+    or canonical SMILES.
+    """
+    if inchikey:
+        for info in grouped.values():
+            if info["meta"].get("INCHIKEY") == inchikey:
+                return info
+    if canonical_smiles:
+        for info in grouped.values():
+            lib_smi = info["meta"].get("SMILES", "")
+            if lib_smi == canonical_smiles:
+                return info
+            if _canonicalize_smiles_safe(lib_smi) == canonical_smiles:
+                return info
+    return None
+
+
+def _structure_key(meta: Dict[str, Any]) -> str:
+    """
+    Build a key that identifies a unique structure across collision energies.
+
+    Prefer INCHIKEY; fall back to combination of formula, SMILES, and adduct.
+    """
+    inchikey = meta.get("INCHIKEY")
+    if inchikey:
+        return inchikey
+
+    formula = meta.get("FORMULA", "")
+    smiles = meta.get("SMILES", "")
+    adduct = meta.get("ADDUCT", "")
+    return f"{formula}|{smiles}|{adduct}"
+
+
+def load_library_spectra_grouped(
+    mgf_path: Path,
+    progress_cb=None,
+    interested_ces=None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Load predicted spectra from an .mgf file and group them by structure.
+
+    Returns:
+        dict keyed by structure_key with:
+        {
+          "meta": representative_meta_for_structure (no COLLISION_ENERGY),
+          "spectra": List[MassSpec],
+        }
+    """
+    if not mgf_path.exists():
+        raise FileNotFoundError(f"MGF file not found: {mgf_path.stem}")
+
+    parsed = common.parse_spectra_mgf(str(mgf_path))
+    if progress_cb:
+        progress_cb("load_mgf", 20, "Loading predicted spectra (.mgf)")
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    total = max(1, len(parsed))
+
+    for idx, (meta, peaks) in enumerate(parsed, start=1):
+        if len(peaks) == 0:
+            continue
+
+        ce_str = meta.get("COLLISION_ENERGY", None)
+        if ce_str is None:
+            continue
+        try:
+            ce_val = round_ev(ce_str)
+            if interested_ces is not None:
+                if str(ce_val) not in interested_ces:
+                    continue
+        except ValueError:
+            continue
+
+        masses = peaks[:, 0]
+        intens = peaks[:, 1]
+
+        frags_raw = meta.get("FRAGS")
+        if frags_raw is not None:
+            # FRAGS like: "65535,65520,31,65520,..."
+            try:
+                # Split on comma or whitespace
+                frag_tokens = [
+                    tok for tok in frags_raw.replace(",", " ").split() if tok
+                ]
+                frags = [int(tok) for tok in frag_tokens]
+                if len(frags) == len(masses):
+                    # attach as numpy array or list – explain_peaks expects something iterable
+                    int_frags = np.asarray(frags, dtype=int)
+                else:
+                    # length mismatch – safest is to skip
+                    int_frags = None
+            except Exception:
+                int_frags = None
+        else:
+            int_frags = None
+
+        ms = MassSpec(
+            collision_energy=ce_val,
+            root_canonical_smiles=meta.get("SMILES"),
+            adduct=meta.get("ADDUCT"),
+            remark=meta.get("DESCRIPTION"),
+            masses=masses,
+            intens=intens,
+            int_frags=int_frags,
+            **{
+                k: v
+                for k, v in meta.items()
+                if k not in ["SMILES", "ADDUCT", "DESCRIPTION", "COLLISION_ENERGY"]
+            },
+        )
+
+        key = _structure_key(meta)
+        if key not in grouped:
+            # store a representative meta for the structure (without COLLISION_ENERGY)
+            rep_meta = dict(meta)
+            rep_meta.pop("COLLISION_ENERGY", None)
+            grouped[key] = {
+                "meta": rep_meta,
+                "spectra": [],
+            }
+
+        grouped[key]["spectra"].append(ms)
+
+        if progress_cb and (idx % 25 == 0 or idx == total):
+            pct = int(idx / total * 80 + 20)
+            progress_cb("load_mgf", pct, f"Translating ICEBERG spectra ({idx}/{total})")
+
+    # build CompositeMassSpec objects
+    for v in grouped.values():
+        if len(v['spectra']) > 0:
+            v['spectra'] = CompositeMassSpec(v['spectra'])
+
+    return grouped
+
+
+def _massspec_to_peak_objects(ms: MassSpec) -> List[Tuple]:
+    """
+    Convert a MassSpec into a list of simple peak objects suitable for JSON.
+
+    Each peak is:
+        {"mz": float, "inten": float, "frag_id": int or None}
+    """
+    # IMPORTANT: use the original masses/intens arrays so that indices stay
+    # aligned with ms.int_frags.
+    mzs = ms.masses
+    intens = ms.intens
+
+    # Fragment indices (for ICEBERG explanations)
+    int_frags = ms.int_frags
+    if int_frags is not None:
+        try:
+            int_frags = np.asarray(int_frags, dtype=int)
+            if int_frags.shape != mzs.shape:
+                # shape mismatch – ignore fragment info rather than misalign
+                int_frags = None
+        except Exception:
+            int_frags = None
+
+    peaks: List[Tuple] = []
+    for i in range(mzs.size):
+        frag_id = None
+        if int_frags is not None:
+            try:
+                # Fragment bitmasks can exceed JavaScript's Number.MAX_SAFE_INTEGER.
+                # Serialize as a decimal string so the browser doesn't round atoms away.
+                frag_id = str(int(int_frags[i]))
+            except Exception:
+                frag_id = None
+        peaks.append(
+            (
+                float(mzs[i]),
+                float(intens[i]),
+                frag_id,
+            )
+        )
+    return peaks
+
+
+def serialize_pred_spectra_for_frontend(lib_specs: CompositeMassSpec) -> List[Dict[str, Any]]:
+    """
+    Serialize all library (predicted) spectra for a single structure into a JSON-friendly list.
+
+    Each element:
+        {
+          "collision_energy_ev": float,
+          "peaks": [ {mz, inten, frag_id}, ... ]
+        }
+    """
+    payload: List[Dict[str, Any]] = []
+    for _, ms_lib in lib_specs.items():
+        try:
+            ce_val = float(getattr(ms_lib, "collision_energy", 0.0))
+        except Exception:
+            ce_val = 0.0
+
+        peaks = _massspec_to_peak_objects(ms_lib)
+        if not peaks:
+            continue
+
+        payload.append(
+            {
+                "collision_energy_ev": round_ev(ce_val),
+                "peaks": peaks,
+            }
+        )
+    return payload
+
+
+def serialize_user_specs_for_frontend(
+    user_specs: Any,
+    stepped_mode: bool,
+) -> List[Dict[str, Any]]:
+    """
+    Serialize the *processed* experimental spectra that were actually used for retrieval.
+
+    Returns a list of:
+        {
+          "mode": "single" or "stepped",
+          "collision_energy_ev": float or None,
+          "nce": float or None,
+          "peaks": [ {mz, inten}, ... ]
+        }
+    """
+    def _build(ms: MassSpec, mode: str) -> Dict[str, Any]:
+        # For experimental spectra we do not need frag_id
+        if getattr(ms, "spec", None) is not None:
+            spec = np.asarray(ms.spec, dtype=float)
+            if spec.ndim != 2 or spec.shape[1] < 2:
+                return {}
+            mzs = spec[:, 0]
+            intens = spec[:, 1]
+        else:
+            mzs = np.asarray(getattr(ms, "masses", []), dtype=float)
+            intens = np.asarray(getattr(ms, "intens", []), dtype=float)
+            if mzs.shape != intens.shape or mzs.size == 0:
+                return {}
+
+        try:
+            ce_ev = round_ev(getattr(ms, "collision_energy", 0.0))
+        except Exception:
+            ce_ev = 0.0
+
+        # Prefer using a cached NCE on the MassSpec, rather than
+        # recomputing it from eV.
+        nce_val = None
+        if hasattr(ms, "nce"):
+            try:
+                nce_val = float(getattr(ms, "nce"))
+            except Exception:
+                nce_val = None
+
+        peaks = [
+            (float(mzs[i]), float(intens[i]))
+            for i in range(mzs.size)
+        ]
+
+        return {
+            "mode": mode,
+            "collision_energy_ev": ce_ev,
+            "nce": nce_val,
+            "peaks": peaks,
+        }
+
+    out: List[Dict[str, Any]] = []
+
+    if isinstance(user_specs, CompositeMassSpec):
+        # Normal case: one MS per CE bucket
+        for _, ms in user_specs.items():
+            obj = _build(ms, mode="single")
+            if obj:
+                out.append(obj)
+    elif isinstance(user_specs, MassSpec):
+        # Stepped (or single) acquisition collapsed into a single MassSpec
+        mode = "stepped" if stepped_mode else "single"
+        obj = _build(user_specs, mode=mode)
+        if obj:
+            out.append(obj)
+
+    return out
+
+
+def retrieve_candidates(
+    formula: str,
+    adduct: str,
+    user_specs,
+    ignore_precursor: bool = True,
+    apply_denoise: bool = False,
+    top_k: int = 50,
+    stepped_mode: bool = False,
+    stepped_ces: List[str] | None = None,
+    progress_cb=None,
+    include_nist: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Perform spectrum retrieval for a given formula and user spectra.
+
+    When `include_nist=True` and MSPRED_ATLAS_DIR_NIST is configured, also
+    loads structures from the NIST'23 atlas tree and merges them with the
+    public candidates before ranking.
+    """
+    # Precursor m/z for ignoring precursor peak if requested
+    precursor_mz = common.formula_mass(formula) + common.ion2mass[adduct]
+    ignore_mass_val = precursor_mz - 1 if ignore_precursor else None
+
+    if progress_cb:
+        progress_cb("preprocess", 10, "Pre-processing experimental spectrum")
+
+    # Process the experimental spectra
+    if isinstance(user_specs, CompositeMassSpec):
+        all_ces = [ce for ce in user_specs.keys()]
+        user_specs.process_spec_file(parentmass=precursor_mz, denoise=apply_denoise)
+    elif isinstance(user_specs, MassSpec):
+        all_ces = [f'{user_specs.collision_energy:.0f}']
+        user_specs.process_spec_file(parentmass=precursor_mz, denoise=apply_denoise)
+    else:
+        raise TypeError(
+            f"user_specs must be CompositeMassSpec or MassSpec, got {type(user_specs)}"
+        )
+
+    if progress_cb:
+        progress_cb("preprocess", 100, "Experimental spectrum processed")
+
+    if progress_cb:
+        progress_cb("load_mgf", 2, "Loading predicted spectra (.mgf)")
+
+    # Load from public atlas
+    mgf_path = get_mgf_path_for_formula(formula, adduct)
+    lib_grouped = load_library_spectra_grouped(mgf_path, progress_cb, all_ces)
+
+    # Merge NIST atlas (authenticated users only)
+    if include_nist and NIST_MGF_DIR is not None and adduct in NIST_ADDUCT_TO_DIR:
+        nist_subdir = common.get_formula_subdir(formula)
+        nist_mgf_path = NIST_ADDUCT_TO_DIR[adduct] / nist_subdir / f"{formula}.mgf"
+        if nist_mgf_path.exists():
+            try:
+                nist_grouped = load_library_spectra_grouped(nist_mgf_path, None, all_ces)
+                # Merge: public keys take priority on collision; NIST adds new structures
+                for k, v in nist_grouped.items():
+                    if k not in lib_grouped:
+                        lib_grouped[k] = v
+            except Exception:
+                pass  # NIST merge failure is non-fatal
+
+    if progress_cb:
+        progress_cb("load_mgf", 100, f"Loaded {len(lib_grouped)} candidate structures")
+
+    results: List[Dict[str, Any]] = []
+    total = max(1, len(lib_grouped))
+    if progress_cb:
+        progress_cb("rank", 0, "Ranking candidates")
+
+    for idx, (struct_key, info) in enumerate(lib_grouped.items(), start=1):
+        meta_struct = info["meta"]
+        lib_specs: CompositeMassSpec = info["spectra"]
+
+        if stepped_mode:
+            # Merge the *library* CEs that correspond to the stepped acquisition
+            lib_ce_keys = list(lib_specs.keys())  # e.g. ["20", "30", "50"]
+            if not stepped_ces:
+                continue
+
+            # Only keep energies that exist in the library for this structure
+            used_ces = [ce for ce in stepped_ces if ce in lib_ce_keys]
+            if not used_ces:
+                continue
+
+            try:
+                final_score, ce_values = lib_specs.entr_sim(
+                    user_specs,
+                    merge_method="stepped",
+                    stepped_ce=used_ces,
+                    ignore_mass=ignore_mass_val,
+                    return_ce=True,
+                )
+            except ValueError:
+                continue
+
+        else:
+            # Original behaviour: user has separate spectra at each CE
+            final_score, ce_values = lib_specs.entr_sim(
+                user_specs,
+                merge_method="unmerged",
+                ignore_mass=ignore_mass_val,
+                return_ce=True,
+            )
+
+        # Collect collision energies for display
+        ce_values = sorted(ce_values)
+        ce_str = ", ".join(f"{ce:.0f}" for ce in ce_values)
+
+        # Serialize all library spectra (unmerged) for caching on the frontend
+        pred_spectra_payload = serialize_pred_spectra_for_frontend(lib_specs)
+
+        results.append(
+            {
+                "similarity": final_score,
+                "meta": meta_struct,
+                "formula": meta_struct.get("FORMULA", ""),
+                "smiles": meta_struct.get("SMILES", ""),
+                "inchikey": meta_struct.get("INCHIKEY", ""),
+                "adduct": meta_struct.get("ADDUCT", ""),
+                "collision_energy": ce_str,
+                "pred_spectra": pred_spectra_payload,
+            }
+        )
+
+        if progress_cb and (idx % 25 == 0 or idx == total):
+            pct = int(idx / total * 100)
+            progress_cb("rank", pct, f"Ranking candidates ({idx}/{total})")
+
+    if progress_cb:
+        progress_cb("postprocess", 30, "Post-processing results")
+
+    # Sort by similarity descending and take top_k
+    results.sort(key=lambda x: x["similarity"], reverse=True)
+    out = results[:top_k]
+
+    if progress_cb:
+        progress_cb("postprocess", 100, f"Finishing...")
+
+    return out
+
+
+def build_preloaded_spectra_from_form_lists(
+    spectrum_texts: Sequence[str],
+    spectrum_nces: Sequence[str],
+    spectrum_evs: Sequence[str],
+    spectrum_nce_conts: Sequence[str],
+    spectrum_modes: Sequence[str],
+    spectrum_stepped_nces: Sequence[str],
+) -> list[Dict[str, Any]]:
+    """
+    Normalize the spectra fields coming from the HTML form into the structure
+    expected by index.html (sp.text, sp.ev, sp.nce_cont, sp.mode, sp.stepped_nces).
+
+    This is deliberately dumb: it just trusts the hidden fields that were
+    already computed on the client or previous request, instead of trying to
+    recompute NCE/eV relationships.
+    """
+    preloaded: list[Dict[str, Any]] = []
+    n = len(spectrum_texts)
+
+    for i in range(n):
+        raw_text = spectrum_texts[i] or ""
+        text = raw_text.strip()
+        if not text:
+            continue
+
+        # NCE guess
+        nce_guess = None
+        if i < len(spectrum_nces) and spectrum_nces[i]:
+            try:
+                nce_guess = int(float(spectrum_nces[i]))
+            except ValueError:
+                nce_guess = None
+
+        # Continuous NCE (if available)
+        nce_cont = None
+        if i < len(spectrum_nce_conts) and spectrum_nce_conts[i]:
+            try:
+                nce_cont = float(spectrum_nce_conts[i])
+            except ValueError:
+                nce_cont = None
+
+        # EV (if available)
+        ev = None
+        if i < len(spectrum_evs) and spectrum_evs[i]:
+            try:
+                ev = float(spectrum_evs[i])
+            except ValueError:
+                ev = None
+
+        mode = spectrum_modes[i] if i < len(spectrum_modes) and spectrum_modes[i] else "single"
+        stepped_str = (
+            spectrum_stepped_nces[i]
+            if i < len(spectrum_stepped_nces) and spectrum_stepped_nces[i]
+            else ""
+        )
+
+        preloaded.append(
+            {
+                "text": text,
+                "nce_guess": nce_guess,
+                "nce_cont": nce_cont,
+                "ev": ev,
+                "mode": mode,
+                "stepped_nces": stepped_str,
+            }
+        )
+
+    return preloaded
+
+
+# -----------------------------
+# Retrieval job state (file-backed, multi-process safe)
+# -----------------------------
+
+JOB_STORE_DIR = Path(os.environ.get("MSPRED_JOB_DIR", "/tmp/ms_pred_jobs"))
+_JOB_FILE_LOCK = threading.Lock()  # intra-process guard for writes
+
+
+def _ensure_job_store_dir() -> None:
+    try:
+        JOB_STORE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # If we cannot create the directory, later operations will fail
+        # and surface a clear error to the caller.
+        pass
+
+
+@dataclass
+class JobState:
+    created_at: float = field(default_factory=time.time)
+    status: str = "queued"   # queued | running | done | error
+    message: str = ""
+    # progress in [0, 100]
+    progress: dict = field(
+        default_factory=lambda: {
+            "load_mgf": 0,
+            "preprocess": 0,
+            "rank": 0,
+            "postprocess": 0,
+        }
+    )
+    result_context: dict | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "created_at": self.created_at,
+            "status": self.status,
+            "message": self.message,
+            "progress": self.progress,
+            "result_context": self.result_context,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "JobState":
+        js = cls()
+        js.created_at = float(data.get("created_at", time.time()))
+        js.status = data.get("status", "queued")
+        js.message = data.get("message", "")
+        js.progress = data.get(
+            "progress",
+            {
+                "load_mgf": 0,
+                "preprocess": 0,
+                "rank": 0,
+                "postprocess": 0,
+            },
+        )
+        js.result_context = data.get("result_context")
+        js.error = data.get("error")
+        return js
+
+
+def _job_path(job_id: str) -> Path:
+    _ensure_job_store_dir()
+    return JOB_STORE_DIR / f"{job_id}.json"
+
+
+def _job_save(job_id: str, state: JobState) -> None:
+    """
+    Atomically write job state to disk so that multiple processes can
+    read it safely. We write to a temporary file and then rename.
+    """
+    path = _job_path(job_id)
+    tmp_path = path.with_suffix(".json.tmp")
+    payload = state.to_dict()
+
+    with _JOB_FILE_LOCK:
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+
+
+def _job_load(job_id: str) -> JobState | None:
+    """
+    Read job state from disk. Returns None if the job does not exist
+    or if the file is unreadable/corrupt.
+    """
+    path = _job_path(job_id)
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return JobState.from_dict(data)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        # Corrupted/partial file – treat as missing
+        return None
+
+
+def _job_create(job_id: str, **kwargs) -> JobState:
+    js = JobState(**kwargs)
+    _job_save(job_id, js)
+    return js
+
+
+def _job_set(job_id: str, **kwargs) -> None:
+    js = _job_load(job_id)
+    if not js:
+        return
+    for k, v in kwargs.items():
+        setattr(js, k, v)
+    _job_save(job_id, js)
+
+
+def _job_update_progress(
+    job_id: str, key: str, value: int, message: str | None = None
+) -> None:
+    value = int(max(0, min(100, value)))
+    js = _job_load(job_id)
+    if not js:
+        return
+    js.progress[key] = value
+    if message is not None:
+        js.message = message
+    _job_save(job_id, js)
+
+
+def _job_get(job_id: str) -> JobState | None:
+    return _job_load(job_id)
+
+
+def _cleanup_old_jobs(ttl_seconds: int = 3600) -> None:
+    """
+    Best-effort cleanup of old job files based on modification time.
+    This is safe across processes because we're only deleting files.
+    """
+    _ensure_job_store_dir()
+    now = time.time()
+    try:
+        for path in JOB_STORE_DIR.glob("*.json"):
+            try:
+                st = path.stat()
+            except FileNotFoundError:
+                continue
+            if now - st.st_mtime > ttl_seconds:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+    except Exception:
+        # Cleanup is non-critical; ignore errors here.
+        pass
+
+
+# -----------------------------------------------------------------------------
+# Flask application + Flask-Login
+# -----------------------------------------------------------------------------
+app = Flask(__name__)
+app.secret_key = os.environ["FLASK_SECRET_KEY"]
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)  # real IPs from NGINX
+
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
+register_session_auth(app, ICEBERG_USERS_FILE,
+                      record_event=lambda *args: _record_webdav_request(*args))
+
+app.jinja_env.globals["CONTACT_EMAIL"] = _CONTACT_EMAIL
+
+_VALID_ROLES = {"admin", "authorized_user", "user"}
+
+
+class _User(UserMixin):
+    """Flask-Login user backed by ICEBERG_USERS_FILE YAML with role support."""
+
+    def __init__(self, email: str, role: str = "user"):
+        self.id = email
+        self.role = role
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == "admin" or self.id in _ADMIN_EMAILS_ENV
+
+    @property
+    def can_access_nist(self) -> bool:
+        return self.role in ("admin", "authorized_user") or self.id in _ADMIN_EMAILS_ENV
+
+
+def _load_users() -> Dict[str, Any]:
+    """Load the users YAML, returning a dict. Returns {} if missing/unconfigured."""
+    if ICEBERG_USERS_FILE is None or not ICEBERG_USERS_FILE.exists():
+        return {}
+    try:
+        with open(ICEBERG_USERS_FILE, "r") as fh:
+            return yaml.safe_load(fh) or {}
+    except Exception:
+        return {}
+
+
+def _save_users(users: Dict[str, Any]) -> None:
+    """Atomically write the users dict to ICEBERG_USERS_FILE."""
+    if ICEBERG_USERS_FILE is None:
+        raise RuntimeError("ICEBERG_USERS_FILE is not configured.")
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=ICEBERG_USERS_FILE.parent, suffix=".yaml.tmp"
+    )
+    try:
+        with os.fdopen(tmp_fd, "w") as fh:
+            yaml.dump(users, fh, default_flow_style=False)
+        os.replace(tmp_path, ICEBERG_USERS_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _get_record(users: Dict[str, Any], email: str) -> Optional[Dict[str, Any]]:
+    """
+    Return the user record for *email*, normalising legacy flat-string entries.
+    Legacy format: {email: "<hash>"} → treated as role "user".
+    New format:    {email: {password: "<hash>", role: "...", created: "..."}}
+    Returns None if the email is not present.
+    """
+    raw = users.get(email)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return {"password": raw, "role": "user", "created": ""}
+    return raw
+
+
+@login_manager.user_loader
+def _load_user(user_id: str):
+    users = _load_users()
+    record = _get_record(users, user_id)
+    if record is not None:
+        role = record.get("role", "user")
+        if user_id in _ADMIN_EMAILS_ENV:
+            role = "admin"
+        return _User(user_id, role=role)
+    return None
+
+
+def _check_credentials(email: str, password: str) -> bool:
+    """Return True if email/password match an entry in the users file."""
+    users = _load_users()
+    record = _get_record(users, email)
+    if record is None:
+        return False
+    try:
+        return check_password_hash(record["password"], password)
+    except Exception:
+        return False
+
+
+def _update_password(email: str, new_password: str) -> None:
+    """Atomically write a new password hash for *email* into the users file."""
+    if ICEBERG_USERS_FILE is None:
+        raise RuntimeError("ICEBERG_USERS_FILE is not configured.")
+    users = _load_users()
+    record = _get_record(users, email) or {}
+    record["password"] = generate_password_hash(new_password)
+    if "role" not in record:
+        record["role"] = "user"
+    users[email] = record
+    _save_users(users)
+
+
+def admin_required(f):
+    """Decorator: login required AND the user must have admin role."""
+    @functools.wraps(f)
+    @login_required
+    def decorated(*args, **kwargs):
+        if not current_user.is_admin:
+            abort(403)
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ---------------------------------------------------------------------------
+# Password-strength rules (used by both /change_password and admin add-user)
+# ---------------------------------------------------------------------------
+
+_PW_RULES = [
+    (lambda p: len(p) >= 8,                 "at least 8 characters"),
+    (lambda p: any(c.isupper() for c in p), "an uppercase letter"),
+    (lambda p: any(c.islower() for c in p), "a lowercase letter"),
+    (lambda p: any(c.isdigit() for c in p), "a digit"),
+    (lambda p: any(not c.isalnum() for c in p), "a special character"),
+]
+
+
+def _password_errors(password: str) -> List[str]:
+    """Return a list of unmet rule descriptions, empty if the password is strong."""
+    return [desc for check, desc in _PW_RULES if not check(password)]
+
+
+# ---------------------------------------------------------------------------
+# Email + random password helpers
+# ---------------------------------------------------------------------------
+
+def _generate_initial_password(length: int = 14) -> str:
+    """
+    Generate a random password that is guaranteed to satisfy _password_errors().
+    Ensures at least one upper, lower, digit, and special character; then fills
+    the remainder from the full printable ASCII alphabet and shuffles.
+    """
+    specials = "!@#$%^&*()-_=+[]{}|;:,.<>?"
+    alphabet = string.ascii_letters + string.digits + specials
+    while True:
+        # Build mandatory characters first
+        chars = [
+            secrets.choice(string.ascii_uppercase),
+            secrets.choice(string.ascii_lowercase),
+            secrets.choice(string.digits),
+            secrets.choice(specials),
+        ]
+        # Fill the rest
+        chars += [secrets.choice(alphabet) for _ in range(length - 4)]
+        secrets.SystemRandom().shuffle(chars)
+        pw = "".join(chars)
+        if not _password_errors(pw):  # double-check; defined below
+            return pw
+
+
+def _send_email(to: str, subject: str, body: str) -> Optional[str]:
+    """
+    Send a plain-text credential email.
+    Returns None if email is not configured, empty string on success,
+    or an error message string if the send failed.
+    """
+    if not _SMTP_HOST:
+        app.logger.warning("Email not configured; skipping email to %s", to)
+        return None
+
+    try:
+        sender = _SMTP_FROM or _SMTP_USER
+        msg = EmailMessage()
+        msg["From"] = sender
+        msg["To"] = to
+        if sender:
+            msg["Bcc"] = sender
+        msg["Subject"] = subject
+        msg.set_content(body)
+
+        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=10) as smtp:
+            if _SMTP_USE_TLS:
+                smtp.starttls()
+            if _SMTP_USER and _SMTP_PASSWORD:
+                smtp.login(_SMTP_USER, _SMTP_PASSWORD)
+            smtp.send_message(msg)
+        return ""
+    except Exception as exc:
+        app.logger.error("Failed to send email to %s: %s", to, exc)
+        return str(exc)
+
+
+def _build_credential_email(email: str, password: str, kind: str = "new") -> tuple[str, str]:
+    """Return (subject, body) for a credential email using the configured templates."""
+    if kind == "new":
+        subject, body_tpl = _EMAIL_SUBJECT_NEW, _EMAIL_BODY_NEW
+    else:
+        subject, body_tpl = _EMAIL_SUBJECT_RESET, _EMAIL_BODY_RESET
+    body = body_tpl.format(email=email, password=password, contact=_CONTACT_EMAIL)
+    return subject, body
+
+
+# ---------------------------------------------------------------------------
+# Analytics helpers (SQLite)
+# ---------------------------------------------------------------------------
+
+_ANALYTICS_INIT_DONE = False
+_SKIP_ANALYTICS_PREFIXES = ("/static/", "/admin/api/", "/favicon", "/_internal/")
+_ANALYTICS_CACHE_TTL_SECONDS = int(os.environ.get("ICEBERG_ANALYTICS_CACHE_TTL_SECONDS", "300"))
+_ANALYTICS_AGG_BATCH_ROWS = int(os.environ.get("ICEBERG_ANALYTICS_AGG_BATCH_ROWS", "50000"))
+_ANALYTICS_AGG_REFRESH_SECONDS = int(os.environ.get("ICEBERG_ANALYTICS_AGG_REFRESH_SECONDS", "60"))
+_ANALYTICS_AGG_LOCK_SECONDS = int(os.environ.get("ICEBERG_ANALYTICS_AGG_LOCK_SECONDS", "300"))
+_ANALYTICS_GEO_RESOLVE_LIMIT = int(os.environ.get("ICEBERG_ANALYTICS_GEO_RESOLVE_LIMIT", "100"))
+_ANALYTICS_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+_analytics_cache_lock = threading.Lock()
+_analytics_refresh_thread_lock = threading.Lock()
+_analytics_last_refresh_started = 0.0
+
+
+def _analytics_conn() -> Optional[sqlite3.Connection]:
+    """Open a WAL-mode SQLite connection to the analytics DB, or None if unconfigured."""
+    if _ANALYTICS_DB_PATH is None:
+        return None
+    try:
+        conn = sqlite3.connect(str(_ANALYTICS_DB_PATH), timeout=5)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+    except Exception:
+        return None
+
+
+def _analytics_window_arg(default: str = "30") -> str:
+    """Return a supported analytics window: 30, 90, 365, or all."""
+    window = (request.args.get("days") or default).strip().lower()
+    if window in {"30", "90", "365", "all"}:
+        return window
+    return default
+
+
+def _analytics_cutoff_day(window: str) -> Optional[str]:
+    if window == "all":
+        return None
+    try:
+        days = int(window)
+    except ValueError:
+        days = 30
+    return (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+
+
+def _analytics_day(ts: str) -> Optional[str]:
+    if not ts or len(ts) < 10:
+        return None
+    return ts[:10]
+
+
+def _analytics_cache_get(kind: str, window: str) -> Optional[Dict[str, Any]]:
+    now = time.monotonic()
+    key = (kind, window)
+    with _analytics_cache_lock:
+        item = _ANALYTICS_CACHE.get(key)
+        if item is None:
+            return None
+        expires_at, payload = item
+        if expires_at < now:
+            _ANALYTICS_CACHE.pop(key, None)
+            return None
+        return payload
+
+
+def _analytics_cache_set(kind: str, window: str, payload: Dict[str, Any]) -> None:
+    if _ANALYTICS_CACHE_TTL_SECONDS <= 0:
+        return
+    expires_at = time.monotonic() + _ANALYTICS_CACHE_TTL_SECONDS
+    with _analytics_cache_lock:
+        _ANALYTICS_CACHE[(kind, window)] = (expires_at, payload)
+
+
+def _analytics_cache_clear() -> None:
+    with _analytics_cache_lock:
+        _ANALYTICS_CACHE.clear()
+
+
+def _analytics_meta_get(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM analytics_meta WHERE key = ?", (key,)).fetchone()
+    return str(row[0]) if row and row[0] is not None else default
+
+
+def _analytics_meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """INSERT INTO analytics_meta (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+        (key, value),
+    )
+
+
+def _analytics_lock_owner_alive(owner: str) -> bool:
+    try:
+        pid = int(str(owner).split(":", 1)[0])
+    except (TypeError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _ensure_analytics_schema() -> None:
+    """Lazily create tables on first use."""
+    global _ANALYTICS_INIT_DONE
+    if _ANALYTICS_INIT_DONE:
+        return
+    conn = _analytics_conn()
+    if conn is None:
+        return
+    try:
+        with conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS requests (
+                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts      TEXT NOT NULL,
+                    ip      TEXT,
+                    path    TEXT,
+                    method  TEXT,
+                    user_id TEXT,
+                    source  TEXT DEFAULT 'web'
+                )
+            """)
+            request_cols = {row[1] for row in conn.execute("PRAGMA table_info(requests)").fetchall()}
+            if "source" not in request_cols:
+                conn.execute("ALTER TABLE requests ADD COLUMN source TEXT DEFAULT 'web'")
+            conn.execute("UPDATE requests SET source = 'web' WHERE source IS NULL OR source = ''")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS ip_geo (
+                    ip           TEXT PRIMARY KEY,
+                    country      TEXT,
+                    lat          REAL,
+                    lon          REAL,
+                    resolved_ts  TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS analytics_meta (
+                    key    TEXT PRIMARY KEY,
+                    value  TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS analytics_locks (
+                    name        TEXT PRIMARY KEY,
+                    owner       TEXT,
+                    expires_at  REAL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS analytics_day_ip (
+                    day       TEXT NOT NULL,
+                    ip        TEXT NOT NULL,
+                    requests  INTEGER NOT NULL,
+                    PRIMARY KEY (day, ip)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS analytics_action_day_ip (
+                    day       TEXT NOT NULL,
+                    action    TEXT NOT NULL,
+                    ip        TEXT NOT NULL,
+                    requests  INTEGER NOT NULL,
+                    PRIMARY KEY (day, action, ip)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_ts  ON requests(ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_ip  ON requests(ip)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_source ON requests(source)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_analytics_day_ip_day ON analytics_day_ip(day)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_analytics_action_day_ip_day ON analytics_action_day_ip(day)")
+        _ANALYTICS_INIT_DONE = True
+    except Exception as exc:
+        app.logger.debug("Analytics schema init error: %s", exc)
+    finally:
+        conn.close()
+
+
+def _analytics_try_acquire_lock(conn: sqlite3.Connection, name: str, owner: str) -> bool:
+    now = time.time()
+    expires_at = now + _ANALYTICS_AGG_LOCK_SECONDS
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT owner, expires_at FROM analytics_locks WHERE name = ?", (name,)).fetchone()
+        if row and row[1] is not None and float(row[1]) > now and _analytics_lock_owner_alive(row[0]):
+            conn.rollback()
+            return False
+        conn.execute(
+            """INSERT INTO analytics_locks (name, owner, expires_at) VALUES (?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at""",
+            (name, owner, expires_at),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def _analytics_release_lock(conn: sqlite3.Connection, name: str, owner: str) -> None:
+    try:
+        with conn:
+            conn.execute("DELETE FROM analytics_locks WHERE name = ? AND owner = ?", (name, owner))
+    except Exception:
+        pass
+
+
+def _resolve_unresolved_geo_from_aggregates(limit: int = _ANALYTICS_GEO_RESOLVE_LIMIT) -> None:
+    if not _GEOIP_DB_PATH or limit <= 0:
+        return
+    conn = _analytics_conn()
+    if conn is None:
+        return
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT a.ip
+               FROM analytics_day_ip a
+               LEFT JOIN ip_geo g ON a.ip = g.ip
+               WHERE a.ip != '' AND g.ip IS NULL
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        unresolved = [r[0] for r in rows if r[0] and not _is_private_ip(r[0])]
+    except Exception:
+        unresolved = []
+    finally:
+        conn.close()
+    if unresolved:
+        _resolve_geo_ips(unresolved)
+
+
+def _analytics_aggregate_state(conn: sqlite3.Connection) -> Dict[str, Any]:
+    try:
+        max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM requests").fetchone()[0] or 0
+    except Exception:
+        max_id = 0
+    try:
+        last_id = int(_analytics_meta_get(conn, "last_aggregated_request_id", "0"))
+    except ValueError:
+        last_id = 0
+    return {
+        "last_request_id": last_id,
+        "max_request_id": max_id,
+        "pending_requests": max(0, int(max_id) - int(last_id)),
+        "last_refresh_ts": _analytics_meta_get(conn, "last_aggregate_refresh_ts", ""),
+    }
+
+
+def _refresh_analytics_aggregates(max_batches: int = 1) -> int:
+    """Incrementally fold raw request rows into persistent aggregate tables."""
+    _ensure_analytics_schema()
+    if _ANALYTICS_DB_PATH is None:
+        return 0
+
+    owner = f"{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
+    conn = _analytics_conn()
+    if conn is None:
+        return 0
+    if not _analytics_try_acquire_lock(conn, "aggregate_refresh", owner):
+        conn.close()
+        return 0
+
+    processed = 0
+    try:
+        for _ in range(max(1, max_batches)):
+            last_id_raw = _analytics_meta_get(conn, "last_aggregated_request_id", "0")
+            try:
+                last_id = int(last_id_raw)
+            except ValueError:
+                last_id = 0
+            rows = conn.execute(
+                """SELECT id, ts, COALESCE(ip, ''), COALESCE(path, ''), COALESCE(method, '')
+                   FROM requests
+                   WHERE id > ?
+                   ORDER BY id
+                   LIMIT ?""",
+                (last_id, _ANALYTICS_AGG_BATCH_ROWS),
+            ).fetchall()
+            if not rows:
+                _analytics_meta_set(conn, "last_aggregate_refresh_ts", datetime.now(timezone.utc).isoformat())
+                conn.commit()
+                break
+
+            day_ip_counts: Dict[Tuple[str, str], int] = {}
+            action_counts: Dict[Tuple[str, str, str], int] = {}
+            max_id = last_id
+            for req_id, ts, ip, path, method in rows:
+                max_id = max(max_id, int(req_id))
+                day = _analytics_day(ts)
+                if day is None:
+                    continue
+                day_key = (day, ip or "")
+                day_ip_counts[day_key] = day_ip_counts.get(day_key, 0) + 1
+                action = _classify_action(path or "", method or "")
+                if action is not None:
+                    action_key = (day, action, ip or "")
+                    action_counts[action_key] = action_counts.get(action_key, 0) + 1
+
+            with conn:
+                conn.executemany(
+                    """INSERT INTO analytics_day_ip (day, ip, requests) VALUES (?, ?, ?)
+                       ON CONFLICT(day, ip) DO UPDATE SET requests = requests + excluded.requests""",
+                    [(day, ip, count) for (day, ip), count in day_ip_counts.items()],
+                )
+                conn.executemany(
+                    """INSERT INTO analytics_action_day_ip (day, action, ip, requests) VALUES (?, ?, ?, ?)
+                       ON CONFLICT(day, action, ip) DO UPDATE SET requests = requests + excluded.requests""",
+                    [(day, action, ip, count) for (day, action, ip), count in action_counts.items()],
+                )
+                _analytics_meta_set(conn, "last_aggregated_request_id", str(max_id))
+                _analytics_meta_set(conn, "last_aggregate_refresh_ts", datetime.now(timezone.utc).isoformat())
+
+            processed += len(rows)
+            if len(rows) < _ANALYTICS_AGG_BATCH_ROWS:
+                break
+
+        if processed:
+            _analytics_cache_clear()
+            _resolve_unresolved_geo_from_aggregates()
+        return processed
+    except Exception as exc:
+        app.logger.debug("analytics aggregate refresh error: %s", exc)
+        return processed
+    finally:
+        _analytics_release_lock(conn, "aggregate_refresh", owner)
+        conn.close()
+
+
+def _analytics_refresh_worker(max_batches: int = 1) -> None:
+    try:
+        _refresh_analytics_aggregates(max_batches=max_batches)
+    except Exception as exc:
+        app.logger.debug("analytics refresh worker error: %s", exc)
+
+
+def _maybe_start_analytics_refresh(force: bool = False) -> None:
+    global _analytics_last_refresh_started
+    if _ANALYTICS_DB_PATH is None:
+        return
+    now = time.monotonic()
+    with _analytics_refresh_thread_lock:
+        if not force and now - _analytics_last_refresh_started < _ANALYTICS_AGG_REFRESH_SECONDS:
+            return
+        _analytics_last_refresh_started = now
+        thread = threading.Thread(target=_analytics_refresh_worker, daemon=True)
+        thread.start()
+
+
+def _record_webdav_request(ip, path, method, user_id):
+    """Write trusted DAV service events through the existing analytics pipeline."""
+    conn = None
+    try:
+        _ensure_analytics_schema()
+        conn = _analytics_conn()
+        if conn is None:
+            return False
+        with conn:
+            conn.execute(
+                "INSERT INTO requests (ts, ip, path, method, user_id, source) VALUES (?,?,?,?,?,?)",
+                (datetime.now(timezone.utc).isoformat(), ip, path, method, user_id, "webdav"),
+            )
+        _maybe_start_analytics_refresh()
+        return True
+    except Exception:
+        app.logger.warning("WebDAV analytics write failed")
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _log_request(response):
+    """after_request hook: record each request in the analytics DB."""
+    try:
+        path = request.path
+        if any(path.startswith(p) for p in _SKIP_ANALYTICS_PREFIXES):
+            return response
+        _ensure_analytics_schema()
+        conn = _analytics_conn()
+        if conn is None:
+            return response
+        ts = datetime.now(timezone.utc).isoformat()
+        ip = request.remote_addr or ""
+        user_id = current_user.id if current_user.is_authenticated else ""
+        with conn:
+            conn.execute(
+                "INSERT INTO requests (ts, ip, path, method, user_id, source) VALUES (?,?,?,?,?,?)",
+                (ts, ip, path, request.method, user_id, "web"),
+            )
+        conn.close()
+        _maybe_start_analytics_refresh()
+    except Exception:
+        pass  # never break a response
+    return response
+
+
+def _classify_action(path: str, method: str) -> Optional[str]:
+    """Map a logged request to a human-readable user action, or None to exclude as noise."""
+    if path == "/api/query_smiles":         return "Explore atlas (structure → spectrum)"
+    if path == "/api/resolve_query":        return "Compound lookup (name / InChI / CID)"
+    if path == "/api/retrieve_start":       return "Spectrum → structure retrieval"
+    if path == "/download_mgf":             return "Download predicted spectra (.mgf)"
+    if path == "/api/event/download_ms":    return "Download spectra (.ms)"
+    if path.startswith("/webdav/browse/"): return "WebDAV browse directory"
+    if path.startswith("/webdav/download/"): return "WebDAV download request"
+    if path.startswith("/webdav/metadata/"): return "WebDAV metadata check"
+    if path.startswith("/webdav/denied/"): return "WebDAV denied access"
+    if path.startswith("/webdav/auth_failed/"): return "WebDAV failed login"
+    if path.startswith("/sftp/auth"):       return "SFTP login"
+    if path.startswith("/sftp/realpath"):   return "SFTP resolve path"
+    if path.startswith("/sftp/listdir"):    return "SFTP browse directory"
+    if path.startswith("/sftp/stat"):       return "SFTP stat"
+    if path.startswith("/sftp/open"):       return "SFTP download file"
+    if path == "/upload_ms":                return "Upload experimental spectrum"
+    if path == "/upload_mgf":               return "Upload experimental spectrum (.mgf)"
+    if path == "/load_example_ms":          return "Load example spectrum"
+    if path == "/fragment_svg":             return "View fragment substructure"
+    if path.startswith("/result/"):         return "View retrieval results"
+    if path == "/api/event/bookmarklet":    return "PubChem bookmarklet arrival"
+    if path == "/" and method == "GET":     return "Home page visit"
+    return None  # noise: /mol_png, /api/retrieve_progress/*, /login, /admin/*, etc.
+
+
+def _is_private_ip(ip: str) -> bool:
+    """Return True for loopback/private/link-local IPs."""
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except ValueError:
+        return True
+
+
+def _resolve_geo_ips(ips: List[str]) -> None:
+    """Resolve a list of IPs into ip_geo using the MaxMind GeoLite2 DB."""
+    if not _GEOIP_DB_PATH:
+        return
+    try:
+        import geoip2.database  # type: ignore
+        with geoip2.database.Reader(_GEOIP_DB_PATH) as reader:
+            conn = _analytics_conn()
+            if conn is None:
+                return
+            ts = datetime.now(timezone.utc).isoformat()
+            for ip in ips:
+                if _is_private_ip(ip):
+                    continue
+                try:
+                    r = reader.city(ip)
+                    country = r.country.name or ""
+                    lat = r.location.latitude
+                    lon = r.location.longitude
+                    with conn:
+                        conn.execute(
+                            """INSERT OR REPLACE INTO ip_geo (ip, country, lat, lon, resolved_ts)
+                               VALUES (?,?,?,?,?)""",
+                            (ip, country, lat, lon, ts),
+                        )
+                except Exception:
+                    pass
+            conn.close()
+    except ImportError:
+        pass
+    except Exception as exc:
+        app.logger.debug("geo-IP resolution error: %s", exc)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for("index"))
+    error = None
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        password = request.form.get("password") or ""
+        if _check_credentials(email, password):
+            login_user(_User(email), remember=True)
+            try:
+                users = _load_users()
+                record = _get_record(users, email)
+                if record is not None:
+                    record["last_login"] = datetime.now(timezone.utc).isoformat()
+                    users[email] = record
+                    _save_users(users)
+            except Exception:
+                pass
+            return redirect(request.args.get("next") or url_for("index"))
+        error = "Invalid email or password."
+    return render_template("login.html", error=error)
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    logout_user()
+    return redirect(url_for("index"))
+
+
+@app.route("/change_password", methods=["GET", "POST"])
+@login_required
+def change_password():
+    errors: List[str] = []
+    success = False
+    if request.method == "POST":
+        current_pw = request.form.get("current_password") or ""
+        new_pw = request.form.get("new_password") or ""
+        confirm_pw = request.form.get("confirm_password") or ""
+
+        if not _check_credentials(current_user.id, current_pw):
+            errors.append("Current password is incorrect.")
+        else:
+            rule_errors = _password_errors(new_pw)
+            if rule_errors:
+                errors.append("New password must contain " + ", ".join(rule_errors) + ".")
+            elif new_pw != confirm_pw:
+                errors.append("New passwords do not match.")
+            elif new_pw == current_pw:
+                errors.append("New password must differ from the current password.")
+            else:
+                try:
+                    _update_password(current_user.id, new_pw)
+                    success = True
+                except Exception as e:
+                    errors.append(f"Failed to save password: {e}")
+
+    return render_template("change_password.html", errors=errors, success=success)
+
+
+def _atlas_vfs() -> AtlasVirtualFS:
+    return AtlasVirtualFS(BASE_MGF_DIR, NIST_MGF_DIR)
+
+
+def _files_include_nist() -> bool:
+    return current_user.is_authenticated and current_user.can_access_nist
+
+
+def _files_breadcrumbs(vpath: str) -> List[Dict[str, str]]:
+    normalized = normalize_virtual_path(vpath)
+    crumbs = [{"name": "Files", "url": url_for("files_browser")}]
+    parts = [part for part in normalized.parts if part != "/"]
+    for idx, part in enumerate(parts, start=1):
+        crumb_path = "/".join(parts[:idx])
+        crumbs.append(
+            {
+                "name": part,
+                "url": url_for("files_browser", vpath=crumb_path),
+            }
+        )
+    return crumbs
+
+
+@app.route("/files", defaults={"vpath": ""}, strict_slashes=False)
+@app.route("/files/<path:vpath>", strict_slashes=False)
+@login_required
+def files_browser(vpath: str):
+    vpath = "/" + (vpath or "").strip("/")
+    fs = _atlas_vfs()
+    try:
+        normalized = normalize_virtual_path(vpath)
+        entries = fs.listdir(normalized, include_nist=_files_include_nist())
+        stat_entry = fs.stat(normalized, include_nist=_files_include_nist())
+    except PermissionError:
+        abort(403)
+    except VfsError:
+        abort(404)
+
+    return render_template(
+        "files.html",
+        current_path=str(normalized),
+        current_entry=stat_entry,
+        entries=entries,
+        breadcrumbs=_files_breadcrumbs(str(normalized)),
+    )
+
+
+@app.route("/files/download/<path:vpath>")
+@login_required
+def files_download(vpath: str):
+    vpath = "/" + (vpath or "").strip("/")
+    fs = _atlas_vfs()
+    try:
+        normalized = normalize_virtual_path(vpath)
+        real_path = fs.resolve_real_path(normalized, include_nist=_files_include_nist())
+        stat_entry = fs.stat(normalized, include_nist=_files_include_nist())
+    except PermissionError:
+        abort(403)
+    except VfsError:
+        abort(404)
+    if stat_entry.is_dir:
+        abort(404)
+    return send_file(
+        real_path,
+        mimetype="text/plain",
+        as_attachment=True,
+        download_name=real_path.name,
+    )
+
+
+# Register the analytics logging hook now that the app object exists
+app.after_request(_log_request)
+
+
+# ---------------------------------------------------------------------------
+# Admin dashboard routes
+# ---------------------------------------------------------------------------
+
+@app.route("/admin")
+@admin_required
+def admin_dashboard():
+    """Admin landing page: user table + analytics."""
+    user_filter_fields = ("email", "role", "created", "last_login")
+    users = _load_users()
+    user_list = []
+    for email, raw in sorted(users.items()):
+        record = _get_record(users, email)
+        user_list.append({
+            "email": email,
+            "role": record.get("role", "user") if record else "user",
+            "created": record.get("created", "") if record else "",
+            "last_login": record.get("last_login", "") if record else "",
+        })
+
+    user_filters = {
+        field: (request.args.get(field) or "").strip()
+        for field in user_filter_fields
+    }
+    filtered_users = user_list
+
+    for field, query in user_filters.items():
+        if not query:
+            continue
+        needle = query.lower()
+        filtered_users = [
+            user for user in filtered_users
+            if needle in (user.get(field) or "").lower()
+        ]
+
+    user_sort = (request.args.get("sort") or "email").strip()
+    if user_sort not in user_filter_fields:
+        user_sort = "email"
+    user_direction = (request.args.get("direction") or "asc").strip().lower()
+    if user_direction not in ("asc", "desc"):
+        user_direction = "asc"
+    filtered_users = sorted(
+        filtered_users,
+        key=lambda user: (user.get(user_sort) or "").lower(),
+        reverse=user_direction == "desc",
+    )
+
+    page_size = 20
+    try:
+        user_page = int(request.args.get("page", "1"))
+    except ValueError:
+        user_page = 1
+    total_pages = max(1, (len(filtered_users) + page_size - 1) // page_size)
+    user_page = max(1, min(user_page, total_pages))
+    page_start = (user_page - 1) * page_size
+    page_end = page_start + page_size
+    paged_users = filtered_users[page_start:page_end]
+
+    def user_table_url_args(page=1, sort=None, direction=None):
+        args = {}
+        for field, query in user_filters.items():
+            if query:
+                args[field] = query
+        args["sort"] = sort or user_sort
+        args["direction"] = direction or user_direction
+        if page != 1:
+            args["page"] = page
+        return args
+
+    user_sort_urls = {}
+    for field in user_filter_fields:
+        next_direction = (
+            "desc" if user_sort == field and user_direction == "asc" else "asc"
+        )
+        user_sort_urls[field] = url_for(
+            "admin_dashboard",
+            **user_table_url_args(sort=field, direction=next_direction),
+        )
+
+    _maybe_start_analytics_refresh(force=True)
+    return render_template(
+        "admin.html",
+        users=paged_users,
+        valid_roles=sorted(_VALID_ROLES),
+        geoip_available=bool(_GEOIP_DB_PATH),
+        user_filters=user_filters,
+        user_has_filters=bool(any(user_filters.values())),
+        user_sort=user_sort,
+        user_direction=user_direction,
+        user_sort_urls=user_sort_urls,
+        user_prev_url=(
+            url_for("admin_dashboard", **user_table_url_args(page=user_page - 1))
+            if user_page > 1
+            else ""
+        ),
+        user_next_url=(
+            url_for("admin_dashboard", **user_table_url_args(page=user_page + 1))
+            if user_page < total_pages
+            else ""
+        ),
+        user_page=user_page,
+        user_total_pages=total_pages,
+        user_filtered_count=len(filtered_users),
+        user_total_count=len(user_list),
+        user_start=page_start + 1 if filtered_users else 0,
+        user_end=min(page_end, len(filtered_users)),
+    )
+
+
+@app.route("/admin/users/add", methods=["POST"])
+@admin_required
+def admin_add_user():
+    email = (request.form.get("email") or "").strip().lower()
+    role = (request.form.get("role") or "user").strip()
+    if role not in _VALID_ROLES:
+        role = "user"
+
+    if not email or "@" not in email:
+        flash("Invalid email address.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    users = _load_users()
+    if email in users:
+        flash(f"User {email} already exists.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    password = _generate_initial_password()
+    users[email] = {
+        "password": generate_password_hash(password),
+        "role": role,
+        "created": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_users(users)
+
+    subject, body = _build_credential_email(email, password, kind="new")
+    sent = _send_email(email, subject, body)
+
+    if sent is None:
+        flash(f"User {email} created. Email not configured — temp password: {password}", "warning")
+    elif sent == "":
+        flash(f"User {email} created and credentials emailed. Temp password: {password}", "success")
+    else:
+        flash(f"User {email} created but email failed ({sent}) — temp password: {password}", "error")
+
+    return redirect(url_for("admin_dashboard"))
+
+
+@app.route("/admin/users/reset", methods=["POST"])
+@admin_required
+def admin_reset_password():
+    email = (request.form.get("email") or "").strip().lower()
+    users = _load_users()
+    if email not in users:
+        flash(f"User {email} not found.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    password = _generate_initial_password()
+    record = _get_record(users, email) or {}
+    record["password"] = generate_password_hash(password)
+    users[email] = record
+    _save_users(users)
+
+    subject, body = _build_credential_email(email, password, kind="reset")
+    sent = _send_email(email, subject, body)
+
+    if sent is None:
+        flash(f"Password reset for {email}. Email not configured — temp password: {password}", "warning")
+    elif sent == "":
+        flash(f"Password reset for {email} and emailed. Temp password: {password}", "success")
+    else:
+        flash(f"Password reset for {email} but email failed ({sent}) — temp password: {password}", "error")
+
+    return redirect(url_for("admin_dashboard"))
+
+
+@app.route("/admin/users/delete", methods=["POST"])
+@admin_required
+def admin_delete_user():
+    email = (request.form.get("email") or "").strip().lower()
+    if email == current_user.id:
+        flash("You cannot delete your own account.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    users = _load_users()
+    if email not in users:
+        flash(f"User {email} not found.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    # Guard: don't delete the last admin
+    admins = [e for e, raw in users.items()
+              if (_get_record(users, e) or {}).get("role") == "admin" or e in _ADMIN_EMAILS_ENV]
+    if email in admins and len(admins) <= 1:
+        flash("Cannot delete the last admin account.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    del users[email]
+    _save_users(users)
+    flash(f"User {email} deleted.", "success")
+    return redirect(url_for("admin_dashboard"))
+
+
+@app.route("/admin/users/set_role", methods=["POST"])
+@admin_required
+def admin_set_role():
+    email = (request.form.get("email") or "").strip().lower()
+    new_role = (request.form.get("role") or "user").strip()
+    if new_role not in _VALID_ROLES:
+        flash(f"Invalid role '{new_role}'.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    users = _load_users()
+    if email not in users:
+        flash(f"User {email} not found.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    # Guard: don't demote the last admin
+    if new_role != "admin":
+        admins = [e for e, raw in users.items()
+                  if (_get_record(users, e) or {}).get("role") == "admin" or e in _ADMIN_EMAILS_ENV]
+        if email in admins and len(admins) <= 1:
+            flash("Cannot demote the last admin account.", "error")
+            return redirect(url_for("admin_dashboard"))
+
+    record = _get_record(users, email) or {}
+    record["role"] = new_role
+    users[email] = record
+    _save_users(users)
+    flash(f"Role for {email} set to '{new_role}'.", "success")
+    return redirect(url_for("admin_dashboard"))
+
+
+# ---------------------------------------------------------------------------
+# Client-side event beacons
+# ---------------------------------------------------------------------------
+
+@app.route("/api/event/<event>", methods=["POST"])
+def api_log_event(event: str):
+    """Lightweight no-op endpoint so the after_request hook can log client-side events.
+
+    Client code fires navigator.sendBeacon('/api/event/<event>') for actions that never
+    produce a server request on their own (e.g. the Explore .ms download, bookmarklet
+    arrivals). The path /api/event/<event> is recorded in the analytics DB by _log_request.
+    """
+    if event not in {"download_ms", "bookmarklet"}:
+        return ("", 400)
+    return ("", 204)
+
+
+# ---------------------------------------------------------------------------
+# Admin analytics API
+# ---------------------------------------------------------------------------
+
+@app.route("/admin/api/stats")
+@admin_required
+def admin_api_stats():
+    """Return daily request counts + unique IPs, top actions, top countries."""
+    _ensure_analytics_schema()
+    _maybe_start_analytics_refresh(force=True)
+    window = _analytics_window_arg()
+    cached = _analytics_cache_get("stats", window)
+    if cached is not None:
+        return jsonify(cached)
+
+    conn = _analytics_conn()
+    if conn is None:
+        return jsonify({"error": "Analytics DB not configured"}), 503
+    try:
+        cutoff_day = _analytics_cutoff_day(window)
+        if cutoff_day is None:
+            cur = conn.execute(
+                """SELECT day, SUM(requests) AS reqs,
+                          SUM(CASE WHEN ip != '' THEN 1 ELSE 0 END) AS ips
+                   FROM analytics_day_ip
+                   GROUP BY day
+                   ORDER BY day"""
+            )
+        else:
+            cur = conn.execute(
+                """SELECT day, SUM(requests) AS reqs,
+                          SUM(CASE WHEN ip != '' THEN 1 ELSE 0 END) AS ips
+                   FROM analytics_day_ip
+                   WHERE day >= ?
+                   GROUP BY day
+                   ORDER BY day""",
+                (cutoff_day,),
+            )
+        daily = [{"day": r[0], "requests": r[1], "unique_ips": r[2]} for r in cur.fetchall()]
+
+        if cutoff_day is None:
+            cur = conn.execute(
+                """SELECT action, ip, SUM(requests) AS n
+                   FROM analytics_action_day_ip
+                   GROUP BY action, ip"""
+            )
+        else:
+            cur = conn.execute(
+                """SELECT action, ip, SUM(requests) AS n
+                   FROM analytics_action_day_ip
+                   WHERE day >= ?
+                   GROUP BY action, ip""",
+                (cutoff_day,),
+            )
+        buckets: Dict[str, Any] = {}
+        for label, ip, n in cur.fetchall():
+            b = buckets.setdefault(label, {"count": 0, "ips": set()})
+            b["count"] += n
+            if ip:
+                b["ips"].add(ip)
+        top_actions = sorted(
+            ({"action": k, "count": v["count"], "visitors": len(v["ips"])}
+             for k, v in buckets.items()),
+            key=lambda d: d["count"], reverse=True,
+        )
+
+        if cutoff_day is None:
+            cur = conn.execute(
+                """SELECT g.country, SUM(a.requests) AS n
+                   FROM analytics_day_ip a JOIN ip_geo g ON a.ip = g.ip
+                   WHERE g.country != ''
+                   GROUP BY g.country ORDER BY n DESC LIMIT 20"""
+            )
+        else:
+            cur = conn.execute(
+                """SELECT g.country, SUM(a.requests) AS n
+                   FROM analytics_day_ip a JOIN ip_geo g ON a.ip = g.ip
+                   WHERE a.day >= ? AND g.country != ''
+                   GROUP BY g.country ORDER BY n DESC LIMIT 20""",
+                (cutoff_day,),
+            )
+        top_countries = [{"country": r[0], "count": r[1]} for r in cur.fetchall()]
+        aggregate_state = _analytics_aggregate_state(conn)
+        payload = {
+            "daily": daily,
+            "top_actions": top_actions,
+            "top_countries": top_countries,
+            "window": window,
+            "cached_seconds": _ANALYTICS_CACHE_TTL_SECONDS,
+            "aggregate": aggregate_state,
+        }
+        _analytics_cache_set("stats", window, payload)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.route("/admin/api/geo")
+@admin_required
+def admin_api_geo():
+    """Return aggregated geo points [{lat, lon, country, count}] for the map."""
+    _ensure_analytics_schema()
+    _maybe_start_analytics_refresh(force=True)
+    window = _analytics_window_arg()
+    cached = _analytics_cache_get("geo", window)
+    if cached is not None:
+        return jsonify(cached)
+
+    conn = _analytics_conn()
+    if conn is None:
+        return jsonify({"error": "Analytics DB not configured"}), 503
+    try:
+        cutoff_day = _analytics_cutoff_day(window)
+        if cutoff_day is None:
+            cur = conn.execute(
+                """SELECT g.lat, g.lon, g.country, SUM(a.requests) AS n
+                   FROM analytics_day_ip a JOIN ip_geo g ON a.ip = g.ip
+                   WHERE g.lat IS NOT NULL AND g.lon IS NOT NULL
+                   GROUP BY a.ip
+                   ORDER BY n DESC"""
+            )
+        else:
+            cur = conn.execute(
+                """SELECT g.lat, g.lon, g.country, SUM(a.requests) AS n
+                   FROM analytics_day_ip a JOIN ip_geo g ON a.ip = g.ip
+                   WHERE a.day >= ?
+                     AND g.lat IS NOT NULL AND g.lon IS NOT NULL
+                   GROUP BY a.ip
+                   ORDER BY n DESC""",
+                (cutoff_day,),
+            )
+        points = [{"lat": r[0], "lon": r[1], "country": r[2], "count": r[3]}
+                  for r in cur.fetchall()]
+        aggregate_state = _analytics_aggregate_state(conn)
+        payload = {
+            "points": points,
+            "window": window,
+            "cached_seconds": _ANALYTICS_CACHE_TTL_SECONDS,
+            "aggregate": aggregate_state,
+        }
+        _analytics_cache_set("geo", window, payload)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    results = []
+    formula = ""
+    adduct = "[M+H]+"
+    preloaded_spectra = []  # for rendering spectrum blocks from form data
+    retrieval_data = None
+
+    return render_template(
+        "index.html",
+        results=results,
+        formula=formula,
+        adduct=adduct,
+        preloaded_spectra=preloaded_spectra,
+        retrieval_data=retrieval_data,
+    )
+
+
+def _spectra_payload_from_ms_lines(raw_lines: List[str]) -> List[Dict[str, Any]]:
+    """
+    Shared helper: given the raw lines from a SIRIUS .ms file, return the
+    spectra payload expected by the frontend (for populateSpectraFromUpload).
+    """
+    meta, comp_ms = common.parse_spectra(raw_lines)  # metadata, CompositeMassSpec
+
+    # Try to get parentmass (precursor m/z) from metadata
+    parentmass = None
+    if meta is not None and "parentmass" in meta:
+        try:
+            parentmass = float(meta["parentmass"])
+        except Exception:
+            parentmass = None
+
+    spectra_payload: List[Dict[str, Any]] = []
+
+    # comp_ms.ce_to_ms is a dict; iterating .items() exactly once
+    for ce_key, ms_obj in comp_ms.items():
+        # Assume the labels are NCE
+        if parentmass is not None:
+            ms_obj.nce_to_ev(parentmass)
+
+        # ms_obj.collision_energy has already been normalized to a float-like
+        try:
+            ce_val = float(ms_obj.collision_energy)
+        except Exception:
+            ce_val = 0.0
+
+        spec = ms_obj.spec  # (N, 2) array of [m/z, intensity]
+        if spec is None or len(spec) == 0:
+            continue
+
+        spec_text = "\n".join(f"{mz:.4f} {inten:.4f}" for mz, inten in spec)
+
+        # Derive NCE directly from the collision-energy label (ce_key),
+        # which we assume is given in NCE (%). This avoids converting eV
+        # back to NCE and keeps NCE->eV as the single source of truth.
+        nce_guess = None
+        nce_cont = None
+        try:
+            nce_cont = float(ce_key)
+            # Snap to {5, 10, 15, 20, ..., 100}
+            nce_guess = int(round(nce_cont / 5.0) * 5)
+            nce_guess = max(5, min(100, nce_guess))
+        except Exception:
+            nce_guess = None
+            nce_cont = None
+
+        spectra_payload.append(
+            {
+                "collision_energy": round_ev(ce_val),   # eV
+                "spectrum_text": spec_text,   # "mz intensity" lines
+                "nce_guess": nce_guess,       # bucketed NCE (may be None)
+                "nce_cont": nce_cont,         # estimated NCE (may be None)
+            }
+        )
+
+    return spectra_payload
+
+
+@app.route("/upload_ms", methods=["POST"])
+def upload_ms():
+    """
+    Parse an uploaded .ms (SIRIUS format) file and return spectra as JSON
+    so the frontend can populate spectrum blocks.
+    """
+    file = request.files.get("ms_file")
+    if not file or file.filename == "":
+        return jsonify({"error": "No file uploaded"}), 400
+
+    raw_lines = file.read().decode("utf-8", errors="ignore").splitlines()
+    spectra_payload = _spectra_payload_from_ms_lines(raw_lines)
+
+    return jsonify({"spectra": spectra_payload})
+
+
+def _parse_mgf_collision_energy(
+    ce_str: Optional[str],
+) -> Tuple[Optional[str], Optional[float], Optional[int], Optional[List[float]]]:
+    """
+    Parse a MGF COLLISION_ENERGY tag.
+
+    Returns (mode, nce_cont, nce_guess, stepped_nces):
+      mode        – "single" | "stepped" | None
+      nce_cont    – continuous NCE value for single mode (may differ from bucket)
+      nce_guess   – nearest 5 % bucket for single mode
+      stepped_nces – list of floats for stepped mode
+    """
+    if not ce_str:
+        return None, None, None, None
+
+    ce_str = ce_str.strip()
+
+    # List syntax: [60.0]  or  [10, 20, 30]
+    if ce_str.startswith("[") and ce_str.endswith("]"):
+        tokens = [t.strip() for t in ce_str[1:-1].split(",") if t.strip()]
+        values: List[float] = []
+        for t in tokens:
+            try:
+                values.append(float(t))
+            except ValueError:
+                pass
+        if not values:
+            return None, None, None, None
+        if len(values) == 1:
+            nce = values[0]
+            bucket = max(5, min(100, int(round(nce / 5.0) * 5)))
+            return "single", nce, bucket, None
+        return "stepped", None, None, values
+
+    # Plain scalar: 60.0
+    try:
+        nce = float(ce_str)
+        bucket = max(5, min(100, int(round(nce / 5.0) * 5)))
+        return "single", nce, bucket, None
+    except ValueError:
+        return None, None, None, None
+
+
+def _mgf_features_payload(parsed: List[Tuple[dict, Any]]) -> List[Dict[str, Any]]:
+    """
+    Convert the output of common.parse_spectra_mgf into a list of feature dicts
+    for the frontend MGF feature-selector.
+
+    Entries where MSLEVEL / MS_LEVEL is present and not "2" are skipped (MS1 etc.).
+
+    Each dict:
+      feature_id   – FEATURE_ID tag, or "feature_N"
+      pepmass      – PEPMASS string (may be None)
+      adduct       – ADDUCT string (may be None)
+      formula      – FORMULA string (may be None)
+      num_peaks    – number of peaks
+      spectrum     – dict compatible with populateSpectraFromUpload:
+                     {collision_energy, spectrum_text, nce_mode,
+                      nce_cont, nce_guess, stepped_nces}
+    """
+    features: List[Dict[str, Any]] = []
+    for idx, (meta, peaks) in enumerate(parsed):
+        if peaks is None or len(peaks) == 0:
+            continue
+
+        # Skip non-MS2 entries when the level tag is explicitly present.
+        ms_level = meta.get("MSLEVEL") or meta.get("MS_LEVEL")
+        if ms_level is not None and str(ms_level).strip() != "2":
+            continue
+
+        feature_id = meta.get("FEATURE_ID") or f"feature_{idx + 1}"
+        spectrum_text = "\n".join(
+            f"{mz:.4f} {inten:.4f}" for mz, inten in peaks
+        )
+
+        nce_mode, nce_cont, nce_guess, stepped_nces = _parse_mgf_collision_energy(
+            meta.get("COLLISION_ENERGY")
+        )
+
+        features.append({
+            "feature_id":   feature_id,
+            "pepmass":      meta.get("PEPMASS"),
+            "adduct":       meta.get("ADDUCT"),
+            "formula":      meta.get("FORMULA"),
+            "filename":     meta.get("FILENAME"),
+            "num_peaks":    int(len(peaks)),
+            "spectrum": {
+                "collision_energy": 0,
+                "spectrum_text":    spectrum_text,
+                "nce_mode":         nce_mode,
+                "nce_cont":         nce_cont,
+                "nce_guess":        nce_guess,
+                "stepped_nces":     stepped_nces,
+            },
+        })
+
+    return features
+
+
+@app.route("/upload_mgf", methods=["POST"])
+def upload_mgf():
+    """
+    Parse an uploaded MGF file and return a list of features (one per BEGIN IONS
+    block) as JSON so the frontend can populate a feature-selector dropdown.
+    """
+    file = request.files.get("mgf_file")
+    if not file or file.filename == "":
+        return jsonify({"error": "No file uploaded"}), 400
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mgf", delete=False) as tmp:
+            tmp_path = tmp.name
+            tmp.write(file.read())
+
+        parsed = common.parse_spectra_mgf(tmp_path)
+        features = _mgf_features_payload(parsed)
+
+        if not features:
+            return jsonify({"error": "No spectra found in the MGF file."}), 400
+
+        return jsonify({"features": features})
+
+    except Exception as e:
+        return jsonify({"error": f"Failed to parse MGF file: {e}"}), 500
+
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+@app.route("/load_example_ms", methods=["GET"])
+def load_example_ms():
+    """
+    Load a bundled example SIRIUS .ms file and return spectra as JSON,
+    so the frontend can auto-populate the query spectra.
+    """
+    try:
+        if not EXAMPLE_MS_PATH.is_file():
+            return jsonify({"error": f"Example .ms file not found at {EXAMPLE_MS_PATH}"}), 500
+
+        with EXAMPLE_MS_PATH.open("r", encoding="utf-8", errors="ignore") as f:
+            raw_lines = f.read().splitlines()
+
+        spectra_payload = _spectra_payload_from_ms_lines(raw_lines)
+        if not spectra_payload:
+            return jsonify({"error": "No spectra found in example .ms file."}), 500
+
+        return jsonify({"spectra": spectra_payload})
+    except Exception as e:
+        return jsonify({"error": f"Failed to load example spectrum: {e}"}), 500
+
+
+@app.route("/api/retrieve_start", methods=["POST"])
+def api_retrieve_start():
+    _cleanup_old_jobs()
+
+    # Create job
+    job_id = uuid.uuid4().hex
+    _job_create(job_id, status="queued", message="Queued")
+
+    # Capture whether the user is authenticated (for NIST access).
+    # current_user is request-scoped; capture here before the thread starts.
+    include_nist: bool = current_user.is_authenticated and current_user.can_access_nist
+
+    # Capture the request payload (we will re-use your existing parsing logic)
+    # Use request.form and request.files similarly to your current index() POST handler
+    form_data = request.form.to_dict(flat=False)
+
+    def worker():
+        try:
+            _job_set(job_id, status="running", message="Starting")
+
+            # Reconstruct key values from form_data
+            formula = (form_data.get("formula", [""])[0] or "").strip()
+            adduct = (form_data.get("adduct", ["[M+H]+"])[0] or "[M+H]+").strip()
+            precursor_mz = None
+
+            spectrum_texts = [s for s in form_data.get("spectrum_text", [])]
+            spectrum_nces = [s for s in form_data.get("spectrum_nce", [])]
+            spectrum_modes = [s for s in form_data.get("spectrum_mode", [])]
+            spectrum_stepped_nces = [s for s in form_data.get("spectrum_stepped_nces", [])]
+
+            ignore_precursor = "ignore_precursor" in form_data
+            apply_denoise = "apply_denoise" in form_data
+
+            if not formula:
+                raise ValueError("Chemical formula is required.")
+
+            if adduct not in common.ion2mass:
+                raise ValueError(
+                    f"Unknown adduct: {adduct}. This adduct type is not supported by ICEBERG."
+                )
+
+            # Spectra from text areas (these include anything populated from .ms)
+            has_nonempty_text = any(t.strip() for t in spectrum_texts)
+            if not has_nonempty_text:
+                raise ValueError(
+                    "No valid user spectra were provided (neither pasted nor from .ms file)."
+                )
+
+            # Decide whether we are in stepped-CE mode or normal multi-CE mode
+            # Minimal behaviour: if at least one block is "stepped", we use that
+            # single stepped spectrum and ignore others for now.
+            stepped_indices = [
+                i
+                for i, (txt, mode) in enumerate(zip(spectrum_texts, spectrum_modes))
+                if txt.strip() and mode.strip() == "stepped"
+            ]
+
+            if stepped_indices:
+                # For simplicity, require a single stepped spectrum block
+                if len(stepped_indices) > 1:
+                    raise ValueError(
+                        "Stepped collision energy mode currently supports one "
+                        "spectrum block per query. Please merge your stepped spectra "
+                        "into a single block or use single-NCE mode for others."
+                    )
+
+                idx = stepped_indices[0]
+
+                spec_text = spectrum_texts[idx].strip()
+                if not spec_text:
+                    raise ValueError("Stepped spectrum block is empty.")
+
+                # Parse the stepped experimental spectrum as a single MassSpec
+                peaks = parse_user_spectrum(spec_text)
+                masses = peaks[:, 0]
+                intens = peaks[:, 1]
+
+                # Use a reasonable placeholder CE value; it is not used for matching
+                # in 'stepped' mode except as a key for internal processing.
+                base_nce_str = spectrum_nces[idx] if idx < len(spectrum_nces) else "30"
+                try:
+                    base_nce = float(base_nce_str)
+                except Exception:
+                    base_nce = 30.0
+
+                if formula and adduct in common.ion2mass:
+                    precursor_mz = common.formula_mass(formula) + common.ion2mass[adduct]
+                    try:
+                        ce_val = float(common.nce_to_ev(base_nce, precursor_mz))
+                    except Exception:
+                        ce_val = base_nce
+                else:
+                    ce_val = base_nce
+
+                user_specs = MassSpec(
+                    collision_energy=ce_val,
+                    root_canonical_smiles=None,
+                    adduct=adduct,
+                    remark="User stepped query",
+                    masses=masses,
+                    intens=intens,
+                )
+                # Cache the base stepped NCE on this MassSpec for later display.
+                try:
+                    user_specs.nce = float(base_nce)
+                except Exception:
+                    pass
+
+                # Parse stepped NCE list, e.g. "20,30,50"
+                stepped_str = (
+                    spectrum_stepped_nces[idx]
+                    if idx < len(spectrum_stepped_nces)
+                    else ""
+                )
+                stepped_str = (stepped_str or "").strip()
+                if not stepped_str:
+                    raise ValueError(
+                        "No stepped collision energies were specified for the stepped spectrum."
+                    )
+
+                stepped_ces = [
+                    s.strip()
+                    for s in stepped_str.split(",")
+                    if s.strip()
+                ]
+                if precursor_mz is not None:
+                    stepped_ces = [common.nce_to_ev(_, precursor_mz) for _ in stepped_ces]
+                if not stepped_ces:
+                    raise ValueError(
+                        "Could not parse any valid stepped collision energies."
+                    )
+
+                stepped_mode = True
+
+            else:
+                # Normal behaviour: all spectra are treated as single-NCE and
+                # bundled into a CompositeMassSpec keyed by (approximate) eV.
+                user_specs = prepare_user_spectra(
+                    formula=formula,
+                    adduct=adduct,
+                    texts=spectrum_texts,
+                    nces=spectrum_nces,
+                )
+                stepped_mode = False
+                stepped_ces = None
+
+            if user_specs is None:
+                raise ValueError(
+                    "No valid user spectra were provided (neither pasted nor from .ms file)."
+                )
+
+            def pcb(key, pct, msg):
+                _job_update_progress(job_id, key, pct, msg)
+
+            hits = retrieve_candidates(
+                formula=formula,
+                adduct=adduct,
+                user_specs=user_specs,
+                ignore_precursor=ignore_precursor,
+                apply_denoise=apply_denoise,
+                top_k=50,
+                stepped_mode=stepped_mode,
+                stepped_ces=stepped_ces,
+                progress_cb=pcb,
+                include_nist=include_nist,
+            )
+
+            # Build retrieval_data for mirror plots
+            exp_payload = serialize_user_specs_for_frontend(user_specs, stepped_mode=stepped_mode)
+            retrieval_data = {
+                "exp_spectra": exp_payload,
+                "hits": hits,
+                "stepped_mode": stepped_mode,
+                "warning_msg": None,
+            }
+
+            # Also store enough to re-render input blocks (preloaded_spectra)
+            spectrum_evs = form_data.get("spectrum_ev", [])
+            spectrum_nce_conts = form_data.get("spectrum_nce_cont", [])
+
+            if stepped_mode:
+                kept_indices = [i for i, m in enumerate(spectrum_modes) if m == 'stepped']
+                if len(kept_indices) > 1:
+                    kept_indices = [kept_indices[0]]
+                if len(kept_indices) != len(spectrum_modes):
+                    retrieval_data["warning_msg"] = "Redundant single-collision-energy spectra have been ignored."
+            else:
+                kept_indices = [i for i, m in enumerate(spectrum_modes) if m != 'stepped']
+
+            preloaded_spectra = build_preloaded_spectra_from_form_lists(
+                [spectrum_texts[i] for i in kept_indices],
+                [spectrum_nces[i] for i in kept_indices],
+                [spectrum_evs[i] for i in kept_indices] if len(spectrum_evs) > 0 else [],
+                [spectrum_nce_conts[i] for i in kept_indices] if len(spectrum_nce_conts) > 0 else [],
+                [spectrum_modes[i] for i in kept_indices],
+                [spectrum_stepped_nces[i] for i in kept_indices],
+            )
+
+            ctx = {
+                "results": hits,
+                "formula": formula,
+                "adduct": adduct,
+                "preloaded_spectra": preloaded_spectra,
+                "retrieval_data": retrieval_data,
+            }
+
+            _job_set(job_id, status="done", message="Done", result_context=ctx)
+
+        except Exception as e:
+            _job_set(job_id, status="error", message="Error", error=str(e))
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/retrieve_progress/<job_id>", methods=["GET"])
+def api_retrieve_progress(job_id: str):
+    js = _job_get(job_id)
+    if not js:
+        return jsonify({"error": "job_not_found"}), 404
+    return jsonify({
+        "status": js.status,
+        "message": js.message,
+        "progress": js.progress,
+        "error": js.error,
+    })
+
+
+@app.route("/result/<job_id>", methods=["GET"])
+def retrieval_result(job_id: str):
+    js = _job_get(job_id)
+    if not js:
+        flash("Result not found (job expired). Please run retrieval again.", "warning")
+        return redirect(url_for("index"))
+
+    if js.status == "error":
+        flash(f"Retrieval failed: {js.error}", "danger")
+        return redirect(url_for("index"))
+
+    if js.status != "done" or not js.result_context:
+        flash("Retrieval is still running. Please wait.", "warning")
+        return redirect(url_for("index"))
+
+    ctx = js.result_context
+
+    if 'warning_msg' in ctx["retrieval_data"] and ctx["retrieval_data"]['warning_msg']:
+        flash(ctx["retrieval_data"]['warning_msg'], "warning")
+
+    return render_template(
+        "index.html",
+        results=ctx["results"],
+        formula=ctx["formula"],
+        adduct=ctx["adduct"],
+        preloaded_spectra=ctx["preloaded_spectra"],
+        retrieval_data=ctx["retrieval_data"],
+    )
+
+
+@app.route("/download_mgf")
+def download_mgf():
+    """
+    Download the .mgf file for a given formula.
+    Authenticated internal users also get NIST'23 structures concatenated.
+    Usage: /download_mgf?formula=CH9N3O9S4
+    """
+    formula = request.args.get("formula", "").strip()
+    adduct = request.args.get("adduct", "[M+H]+").strip()
+    if adduct not in ADDUCT_TO_DIR:
+        adduct = "[M+H]+"
+
+    if not formula:
+        flash("Chemical formula is required to download MGF.", "danger")
+        return redirect(url_for("index"))
+
+    include_nist: bool = current_user.is_authenticated and current_user.can_access_nist
+    paths = mgf_paths_for_formula(formula, adduct, include_nist=include_nist)
+
+    if not paths:
+        flash(f"MGF file not found for formula {formula}.", "danger")
+        return redirect(url_for("index"))
+
+    # Single public file — stream directly (most common case, zero-copy)
+    if len(paths) == 1:
+        return send_file(
+            paths[0],
+            mimetype="text/plain",
+            as_attachment=True,
+            download_name=f"{formula}.mgf",
+        )
+
+    # Multiple files (public + NIST) — stream sequentially so the browser can
+    # start downloading before both files have been fully read.
+    def generate_mgf():
+        for p in paths:
+            with open(p, "rb") as fh:
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            yield b"\n"
+
+    content_length = sum(p.stat().st_size for p in paths) + len(paths)
+    return Response(
+        stream_with_context(generate_mgf()),
+        mimetype="text/plain",
+        headers={
+            "Content-Disposition": f'attachment; filename="{formula}.mgf"',
+            "Content-Length": str(content_length),
+        },
+    )
+
+
+@app.route("/mol_png")
+def mol_png():
+    """
+    Render a SMILES string to a PNG using RDKit.
+    Called by the frontend when hovering over a prediction row.
+    Usage: /mol_png?smiles=CCO
+    """
+    smiles = request.args.get("smiles", "").strip()
+    if not smiles:
+        abort(400, description="No SMILES provided.")
+
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            abort(400, description="Invalid SMILES.")
+        img = Draw.MolToImage(mol, size=(300, 300))
+        bio = BytesIO()
+        img.save(bio, format="PNG")
+        bio.seek(0)
+        return send_file(bio, mimetype="image/png")
+    except Exception:
+        abort(500, description="Failed to render molecule.")
+
+
+@app.route("/fragment_svg", methods=["POST"])
+def fragment_svg():
+    """
+    Return an RDKit SVG highlighting the substructure corresponding to a fragment.
+
+    Expected JSON body:
+    {
+        "smiles": "<parent SMILES>",
+        "frag_id": <integer fragment id>
+    }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    smiles = (data.get("smiles") or "").strip()
+    frag_id = data.get("frag_id", None)
+
+    if not smiles:
+        return jsonify({"error": "Missing 'smiles'"}), 400
+    if frag_id is None:
+        return jsonify({"error": "Missing 'frag_id'"}), 400
+
+    try:
+        frag_id_int = int(frag_id)
+    except Exception:
+        return jsonify({"error": "Invalid 'frag_id'"}), 400
+
+    # Optional sizing + chemistry context (used by the SMILES lookup panel).
+    try:
+        size_px = int(data.get("size", 300))
+    except Exception:
+        size_px = 300
+    size_px = max(120, min(800, size_px))
+
+    adduct = (data.get("adduct") or "").strip()
+    try:
+        mz_obs = float(data.get("mz")) if data.get("mz") is not None else None
+    except Exception:
+        mz_obs = None
+
+    try:
+        # Build fragment engine and get highlight information
+        engine = fragmentation.FragmentEngine(smiles, mol_str_type="smiles", mol_str_canonicalized=True)
+        draw_dict = engine.get_draw_dict(frag_id_int)
+
+        mol = draw_dict["mol"]
+        hatoms = list(draw_dict.get("hatoms") or [])
+        hbonds = list(draw_dict.get("hbonds") or [])
+
+        # Draw highlighted substructure as SVG
+        d2d = rdMolDraw2D.MolDraw2DSVG(size_px, size_px)
+        d2d.DrawMolecule(mol, highlightAtoms=hatoms, highlightBonds=hbonds)
+        d2d.FinishDrawing()
+        svg = d2d.GetDrawingText()
+
+        # Compute fragment formula, with h-shift inferred from observed m/z if given.
+        h_shift = 0
+        if mz_obs is not None:
+            try:
+                base_mass = float(engine.single_mass(frag_id_int))
+                h_mass = 1.00784
+                h_shift = int(round((mz_obs - base_mass) / h_mass))
+            except Exception:
+                h_shift = 0
+        try:
+            base_formula = engine.formula_from_frag(frag_id_int, h_shift=h_shift)
+        except Exception:
+            base_formula = ""
+
+        charge_sign = ""
+        if adduct.endswith("+"):
+            charge_sign = "+"
+        elif adduct.endswith("-"):
+            charge_sign = "-"
+
+        return jsonify({
+            "svg": svg,
+            "formula": base_formula,
+            "h_shift": h_shift,
+            "charge_sign": charge_sign,
+            "formula_display": (base_formula + charge_sign) if base_formula else "",
+        })
+    except Exception as e:
+        # Best-effort error message for debugging
+        return jsonify({"error": f"Failed to draw fragment: {e}"}), 500
+
+
+@app.route("/api/query_smiles", methods=["GET"])
+def api_query_smiles():
+    """
+    Look up the predicted spectrum for a SMILES in the precomputed atlas.
+
+    Query params:
+        smiles (required)
+        adduct (default '[M+H]+', or '[M]+' when instrument is GC)
+        nce    (default 50 NCE %, or 70 eV when instrument is GC)
+        instrument (default 'Orbitrap'; GC uses 70 eV and [M]+)
+        ce_mode (optional 'nce' or 'ev'; inferred from instrument if omitted)
+
+    Returns JSON with canonical_smiles, formula, inchikey, adduct, instrument,
+    requested_nce, requested_ce_ev, matched_ce_ev, available_ces, pred_spectrum.
+    """
+    smiles = (request.args.get("smiles") or "").strip()
+    instrument = common.normalize_instrument(request.args.get("instrument") or "Orbitrap")
+    adduct = (request.args.get("adduct") or common.default_adduct_for_instrument(instrument)).strip()
+    nce_raw = request.args.get("nce", "50")
+    ce_mode = (request.args.get("ce_mode") or "").strip().lower()
+    if not ce_mode:
+        ce_mode = "ev" if common.is_gc_instrument(instrument) else "nce"
+
+    if not smiles:
+        return jsonify({"error": "Missing 'smiles'"}), 400
+
+    if adduct not in ADDUCT_TO_DIR:
+        return jsonify({
+            "error": f"Unsupported adduct '{adduct}'. Supported: {list(ADDUCT_TO_DIR.keys())}"
+        }), 400
+
+    try:
+        nce = float(nce_raw)
+    except ValueError:
+        return jsonify({"error": f"Invalid nce '{nce_raw}'"}), 400
+
+    try:
+        keys = smiles_to_lookup_keys(smiles)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    formula = keys["formula"]
+    canonical_smiles = keys["canonical_smiles"]
+    inchikey = keys["inchikey"]
+    include_nist: bool = current_user.is_authenticated and current_user.can_access_nist
+
+    # Collect all atlas paths for this formula/adduct (public, then NIST if authed)
+    mgf_paths = mgf_paths_for_formula(formula, adduct, include_nist=include_nist)
+    if not mgf_paths:
+        return jsonify({
+            "error": f"No predicted spectra found for formula {formula}",
+            "formula": formula,
+            "canonical_smiles": canonical_smiles,
+            "inchikey": inchikey,
+            "adduct": adduct,
+        }), 404
+
+    # LC: NCE -> eV via precursor m/z. GC-EI: the control is already eV (default 70).
+    try:
+        precursor_mz = common.formula_mass(formula) + common.ion2mass[adduct]
+        if ce_mode == "ev" or common.is_gc_instrument(instrument):
+            ce_ev = round_ev(nce)
+        else:
+            ce_ev = round_ev(common.nce_to_ev(nce, precursor_mz))
+    except Exception as e:
+        return jsonify({"error": f"Failed to convert collision energy to eV: {e}"}), 500
+
+    # Search each atlas path; stop at first hit (public before NIST).
+    # Uses the indexed fast path when a .idx sidecar is present.
+    blocks = []
+    for mgf_path in mgf_paths:
+        try:
+            blocks = extract_mgf_blocks_by_inchikey(mgf_path, inchikey)
+        except Exception as e:
+            return jsonify({"error": f"Failed to scan MGF: {e}"}), 500
+        if blocks:
+            break
+
+    if not blocks:
+        if not include_nist and NIST_MGF_DIR is not None and adduct in NIST_ADDUCT_TO_DIR:
+            nist_subdir = common.get_formula_subdir(formula)
+            nist_mgf_path = NIST_ADDUCT_TO_DIR[adduct] / nist_subdir / f"{formula}.mgf"
+            if nist_mgf_path.exists() and inchikey_in_mgf(nist_mgf_path, inchikey):
+                return jsonify({
+                    "error": (
+                        "This structure is present in the NIST'23 atlas, "
+                        "which is available only to signed-in authorized users."
+                    ),
+                    "formula": formula,
+                    "canonical_smiles": canonical_smiles,
+                    "inchikey": inchikey,
+                    "adduct": adduct,
+                    "requires_nist_access": True,
+                }), 403
+        return jsonify({
+            "error": f"Structure not present in atlas for {formula} / {adduct}",
+            "formula": formula,
+            "canonical_smiles": canonical_smiles,
+            "inchikey": inchikey,
+            "adduct": adduct,
+        }), 404
+
+    rep_meta, lib_specs = build_composite_from_blocks(blocks)
+    if lib_specs is None:
+        return jsonify({"error": "Matched structure has no usable spectra"}), 404
+
+    all_ms = list(lib_specs.values())
+    available_ces = sorted({round_ev(getattr(ms, "collision_energy", 0.0)) for ms in all_ms})
+    best_ms = min(all_ms, key=lambda ms: abs(round_ev(getattr(ms, "collision_energy", 0.0)) - ce_ev))
+    matched_ce = round_ev(getattr(best_ms, "collision_energy", 0.0))
+
+    ce_warning = None
+    if abs(matched_ce - ce_ev) > 5.0:
+        ce_warning = (
+            f"No spectrum within ±5 eV of {ce_ev:d} (NCE {nce:g}%); "
+            f"showing closest available ({matched_ce:d} eV)."
+        )
+
+    pred_spectra = serialize_pred_spectra_for_frontend(lib_specs)   # all CEs
+    single = CompositeMassSpec([best_ms])
+    payload_list = serialize_pred_spectra_for_frontend(single)
+    pred_spectrum = payload_list[0] if payload_list else None
+
+    return jsonify({
+        "formula": formula,
+        "canonical_smiles": canonical_smiles,
+        "inchikey": inchikey,
+        "adduct": adduct,
+        "instrument": instrument,
+        "requested_nce": nce,
+        "requested_ce_ev": ce_ev,
+        "precursor_mz": precursor_mz,
+        "matched_ce_ev": matched_ce,
+        "available_ces": available_ces,
+        "ce_warning": ce_warning,
+        "pred_spectra": pred_spectra,
+        "pred_spectrum": pred_spectrum,
+        "library_meta": {
+            "SMILES": rep_meta.get("SMILES", "") if rep_meta else "",
+            "INCHIKEY": rep_meta.get("INCHIKEY", "") if rep_meta else "",
+            "FORMULA": rep_meta.get("FORMULA", "") if rep_meta else "",
+            "ADDUCT": rep_meta.get("ADDUCT", "") if rep_meta else "",
+        },
+    })
+
+
+@app.route("/api/resolve_query", methods=["GET"])
+def api_resolve_query():
+    """
+    Resolve a compound name / InChI / InChIKey to a list of canonical SMILES
+    via the PubChem REST API.
+
+    Query params:
+        query       (required) — the query string
+        query_type  (required) — one of: name | inchi | inchikey
+
+    Returns JSON:
+        {
+          "candidates": [
+            {
+              "canonical_smiles": str,
+              "formula": str,
+              "inchikey": str,
+              "name": str,   # IUPAC name if available
+              "cid": int,
+            },
+            ...
+          ],
+          "error": str | null
+        }
+
+    On PubChem failure returns HTTP 200 with an "error" key so the frontend
+    can surface a user-friendly message without treating it as a network error.
+    """
+    query = (request.args.get("query") or "").strip()
+    query_type = (request.args.get("query_type") or "name").strip().lower()
+
+    if not query:
+        return jsonify({"candidates": [], "error": "Missing 'query'"}), 400
+
+    SUPPORTED_NAMESPACES = {
+        "name": "name",
+        "inchi": "inchi",
+        "inchikey": "inchikey",
+        "cid": "cid",
+    }
+    if query_type not in SUPPORTED_NAMESPACES:
+        return jsonify({
+            "candidates": [],
+            "error": f"Unsupported query_type '{query_type}'. Use name, inchi, inchikey, or cid.",
+        }), 400
+
+    namespace = SUPPORTED_NAMESPACES[query_type]
+
+    # Retry wrapper mirroring candidates_from_pubchem in iceberg_elucidation.py
+    def _pcp_get(q: str, ns: str) -> List[Any]:
+        for attempt in range(3):
+            try:
+                return pcp.get_compounds(q, namespace=ns)
+            except pcp.BadRequestError:
+                return []
+            except (pcp.ServerError, RemoteDisconnected, URLError):
+                if attempt == 2:
+                    raise
+                time.sleep(2 * (attempt + 1))
+        return []
+
+    try:
+        compounds: List[Any] = []
+        if query_type == "inchikey" and len(query) == 14 and query.isalpha():
+            neutral_key = f"{query.upper()}-UHFFFAOYSA-N"
+            compounds.extend(_pcp_get(neutral_key, namespace))
+        compounds.extend(_pcp_get(query, namespace))
+    except Exception as e:
+        return jsonify({
+            "candidates": [],
+            "error": f"PubChem lookup failed: {e}",
+        })
+
+    if not compounds:
+        return jsonify({
+            "candidates": [],
+            "error": f"No PubChem match for '{query}'",
+        })
+
+    candidates: List[Dict[str, Any]] = []
+    seen_connectivity_keys: set = set()
+
+    for cmpd in compounds:
+        smi = getattr(cmpd, "isomeric_smiles", None) or getattr(cmpd, "canonical_smiles", None)
+        if not smi:
+            continue
+
+        try:
+            keys = smiles_to_lookup_keys(smi)
+        except Exception:
+            continue
+
+        ikey = keys.get("inchikey", "")
+        connectivity_key = ikey.split("-", 1)[0] if ikey else ""
+        if not connectivity_key or connectivity_key in seen_connectivity_keys:
+            continue
+        seen_connectivity_keys.add(connectivity_key)
+
+        cid = getattr(cmpd, "cid", None)
+        name = getattr(cmpd, "iupac_name", None) or getattr(cmpd, "synonyms", [None])[0] or ""
+
+        candidates.append({
+            "canonical_smiles": keys["canonical_smiles"],
+            "formula": keys["formula"],
+            "inchikey": ikey,
+            "name": str(name) if name else "",
+            "cid": int(cid) if cid is not None else None,
+        })
+
+        if len(candidates) >= 25:
+            break
+
+    if not candidates:
+        return jsonify({
+            "candidates": [],
+            "error": f"No valid structures resolved for '{query}'",
+        })
+
+    return jsonify({"candidates": candidates, "error": None})
+
+
+def _run_analytics_backfill() -> int:
+    """CLI entry point for one-time/resumable aggregate backfills."""
+    _ensure_analytics_schema()
+    if _ANALYTICS_DB_PATH is None:
+        print("Analytics DB not configured", file=sys.stderr)
+        return 2
+
+    total_processed = 0
+    while True:
+        processed = _refresh_analytics_aggregates(max_batches=1)
+        total_processed += processed
+        conn = _analytics_conn()
+        if conn is None:
+            print("Analytics DB unavailable", file=sys.stderr)
+            return 2
+        try:
+            state = _analytics_aggregate_state(conn)
+        finally:
+            conn.close()
+
+        print(
+            "processed={processed} total_processed={total_processed} "
+            "last_request_id={last_request_id} max_request_id={max_request_id} "
+            "pending_requests={pending_requests} last_refresh_ts={last_refresh_ts}".format(
+                processed=processed,
+                total_processed=total_processed,
+                **state,
+            ),
+            flush=True,
+        )
+        if state["pending_requests"] <= 0:
+            return 0
+        if processed <= 0:
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--analytics-backfill":
+        raise SystemExit(_run_analytics_backfill())
+    app.run(host="0.0.0.0", port=4285, debug=True)
