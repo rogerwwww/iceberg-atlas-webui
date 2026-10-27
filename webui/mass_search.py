@@ -12,7 +12,6 @@ from pathlib import Path
 import re
 import sqlite3
 import tempfile
-import time
 
 from ms_pred import common
 
@@ -32,20 +31,28 @@ def mass_window(mass, ppm=5, mass_type="mz", adduct="[M+H]+"):
     # The WebUI supports singly charged protonated/deprotonated ions only.
     if adduct not in ("[M+H]+", "[M-H]-"):
         raise ValueError("Mass search supports [M+H]+ and [M-H]- adducts.")
-    shift = common.ion2mass[adduct]
+    shift = float(common.ion2mass[adduct])
     neutral = mass - shift if mass_type == "mz" else mass
     precursor_mz = mass if mass_type == "mz" else mass + shift
     if neutral <= 0 or precursor_mz <= 0:
         raise ValueError("Mass is too small for the selected adduct.")
     # Ppm is relative to the value entered, including in precursor-m/z mode.
-    delta = mass * ppm * 1e-6
-    return neutral - delta, neutral + delta, precursor_mz
+    delta = mass * (ppm * 1e-6)
+    lower, upper = neutral - delta, neutral + delta
+    if not math.isfinite(lower) or not math.isfinite(upper):
+        raise ValueError("Mass window must be finite.")
+    return lower, upper, precursor_mz
 
 
 def _index_path(root: Path) -> Path:
+    job_dir = os.environ.get("MSPRED_JOB_DIR")
+    default_cache = (
+        Path(job_dir) / "formula-mass-index" if job_dir
+        else Path(tempfile.gettempdir()) / f"iceberg-mass-index-{os.getuid()}"
+    )
     cache = Path(os.environ.get(
         "ICEBERG_MASS_INDEX_DIR",
-        str(Path(tempfile.gettempdir()) / f"iceberg-mass-index-{os.getuid()}"),
+        str(default_cache),
     ))
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     digest = hashlib.sha256(str(root).encode()).hexdigest()
@@ -53,7 +60,7 @@ def _index_path(root: Path) -> Path:
 
 
 def ensure_mass_index(root: Path, *, rebuild=False) -> Path:
-    """Build once per tree/day, shared across workers, with atomic replacement.
+    """Build once per tree, shared across workers, with atomic replacement.
 
     Raise on unreadable directories rather than silently indexing a partial tree.
     Rebuild explicitly after publishing new formulas to the atlas.
@@ -63,14 +70,11 @@ def ensure_mass_index(root: Path, *, rebuild=False) -> Path:
         raise FileNotFoundError(f"Atlas directory is unavailable: {root.name}")
     index = _index_path(root)
 
-    def fresh():
-        return index.exists() and time.time() - index.stat().st_mtime < 86400
-
-    if not rebuild and fresh():
+    if not rebuild and index.exists():
         return index
     with index.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if not rebuild and fresh():
+        if not rebuild and index.exists():
             return index
         fd, name = tempfile.mkstemp(dir=index.parent, suffix=".sqlite")
         os.close(fd)

@@ -28,11 +28,13 @@ cannot be scored.
 Mass lookup builds a SQLite formula/mass index from MGF filenames on first use,
 separately for each atlas/adduct directory. Only the small index is cached;
 atlas files are read in place. Builds are locked across workers and published
-atomically. A snapshot is reused for up to 24 hours; the next search refreshes
-an older snapshot. The first build can take time on a large atlas. Set
+atomically. Snapshots are reused until explicitly refreshed after publishing
+atlas changes. The first build can take time on a large atlas. Set
 `ICEBERG_MASS_INDEX_DIR` to an absolute, writable cache directory owned by the
-WebUI service user (default: `/tmp/iceberg-mass-index-<uid>`). Keep it private
-and outside the atlas tree and Git.
+WebUI service user (default: `MSPRED_JOB_DIR/formula-mass-index` when the job
+directory is configured, otherwise `/tmp/iceberg-mass-index-<uid>`). A persistent
+cache avoids rebuilding after service restarts. Keep it private and outside
+the atlas tree and Git.
 
 After adding/removing formula files, refresh the index before serving searches.
 You can also prebuild it before first use, using the same environment and service

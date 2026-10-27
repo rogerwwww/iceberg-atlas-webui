@@ -89,6 +89,7 @@ def test_mass_units_and_ppm_denominator(adduct, shift, ppm):
     (0, 10, "mz", "[M+H]+"), (0.5, 10, "mz", "[M+H]+"),
     (100, 15, "mz", "[M+H]+"), (100, "nan", "mz", "[M+H]+"),
     (100, 10, "average", "[M+H]+"), (100, 10, "mz", "[M+Na]+"),
+    ("1.7976931348623157e308", 20, "mz", "[M+H]+"),
 ])
 def test_invalid_mass_query(mass, ppm, kind, adduct):
     with pytest.raises(ValueError):
