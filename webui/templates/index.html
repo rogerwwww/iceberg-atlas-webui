@@ -3210,6 +3210,11 @@
                         if (formulaInput) {
                             formulaInput.value = "C27H56NO7P";
                         }
+                        const searchModeSelect = document.getElementById("search-mode");
+                        if (searchModeSelect) {
+                            searchModeSelect.value = "formula";
+                            searchModeSelect.dispatchEvent(new Event("change"));
+                        }
                     })
                     .catch(err => {
                         console.error(err);
