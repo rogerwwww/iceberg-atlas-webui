@@ -8,6 +8,7 @@
 
     <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
     <script src="{{ url_for('static', filename='iceberg-name-animation.js') }}" defer></script>
+    <script src="{{ url_for('static', filename='retrieval-controls.js') }}" defer></script>
 
     <style>
         body {
@@ -305,6 +306,12 @@
         .row > div {
             flex: 1;
             min-width: 0;
+        }
+        @media (max-width: 600px) {
+            #candidate-fields > div,
+            #mass-fields .row > div {
+                flex-basis: 100%;
+            }
         }
         .btn {
             display: inline-flex;
@@ -1562,7 +1569,7 @@
             const formulaEl = document.getElementById("formula");
             const adductEl = document.getElementById("adduct");
 
-            const formula = formulaEl ? formulaEl.value.trim() : "";
+            const formula = btn.getAttribute("data-formula") || (formulaEl ? formulaEl.value.trim() : "");
             const smiles = btn.getAttribute("data-smiles") || "";
             const adductFromHit = btn.getAttribute("data-adduct") || "";
             const adduct = adductFromHit || (adductEl ? adductEl.value.trim() : "[M+H]+");
@@ -2990,6 +2997,12 @@
             }
 
             // Auto-fill adduct if the value is present in the dropdown.
+            // PEPMASS is an observed precursor m/z, not a neutral mass.
+            const massEl = document.getElementById("query-mass");
+            const massTypeEl = document.getElementById("mass-type");
+            if (massEl) massEl.value = feature.pepmass ? feature.pepmass.trim().split(/\s+/)[0] : "";
+            if (massTypeEl) massTypeEl.value = "mz";
+
             if (feature.adduct) {
                 const adductSel = document.getElementById("adduct");
                 if (adductSel) {
@@ -3005,7 +3018,7 @@
                 let msg = `Feature: ${feature.feature_id} · ${feature.num_peaks} peaks`;
                 if (feature.pepmass) msg += ` · PEPMASS ${feature.pepmass}`;
                 if (feature.adduct)  msg += ` · ${feature.adduct}`;
-                if (!feature.formula) msg += " — please enter the chemical formula above.";
+                if (!feature.formula) msg += " — enter a formula or search by mass above.";
                 hint.textContent = msg;
             }
         }
@@ -4480,10 +4493,17 @@
     <div class="card">
         <h2>Query spectra</h2>
         <form id="query-form" method="post" action="{{ url_for('index') }}" enctype="multipart/form-data">
-            <div class="row">
+            <div class="row" id="candidate-fields">
                 <div>
+                    <label for="search-mode">Search by</label>
+                    <select id="search-mode" name="search_mode">
+                        <option value="formula" {% if search_mode|default('formula') == 'formula' %}selected{% endif %}>Chemical formula</option>
+                        <option value="mass" {% if search_mode|default('formula') == 'mass' %}selected{% endif %}>Mass ± ppm</option>
+                    </select>
+                </div>
+                <div id="formula-fields" {% if search_mode|default('formula') == 'mass' %}hidden{% endif %}>
                     <label for="formula">Chemical formula</label>
-                    <input type="text" id="formula" name="formula" required
+                    <input type="text" id="formula" name="formula" {% if search_mode|default('formula') == 'mass' %}disabled{% else %}required{% endif %}
                            placeholder="e.g. CH9N3O9S4"
                            value="{{ formula|default('') }}">
                 </div>
@@ -4497,11 +4517,42 @@
                 </div>
             </div>
 
+            <div id="mass-fields" {% if search_mode|default('formula') != 'mass' %}hidden{% endif %}>
+                <div class="row" style="margin-top:0.75rem;">
+                    <div>
+                        <label for="mass-type">Mass type</label>
+                        <select id="mass-type" name="mass_type" {% if search_mode|default('formula') != 'mass' %}disabled{% endif %}>
+                            <option value="mz" {% if mass_type|default('mz') == 'mz' %}selected{% endif %}>Precursor m/z</option>
+                            <option value="neutral" {% if mass_type|default('mz') == 'neutral' %}selected{% endif %}>Neutral monoisotopic mass (Da)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="query-mass">Mass</label>
+                        <input type="number" id="query-mass" name="query_mass" min="0.000001" step="any"
+                               placeholder="e.g. 538.3867" value="{{ query_mass|default('') }}"
+                               {% if search_mode|default('formula') == 'mass' %}required{% else %}disabled{% endif %}>
+                    </div>
+                    <div>
+                        <label for="mass-ppm">Mass tolerance</label>
+                        <select id="mass-ppm" name="mass_ppm" {% if search_mode|default('formula') != 'mass' %}disabled{% endif %}>
+                            {% for ppm in [3, 5, 10, 20] %}
+                            <option value="{{ ppm }}" {% if mass_ppm|default(5) == ppm %}selected{% endif %}>± {{ ppm }} ppm</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                </div>
+                <p style="font-size:0.85rem; color:#6b7280;">
+                    Search every formula in the selected window that has predicted spectra in the atlas,
+                    and rank all matching structures together. No formula is required.
+                    The adduct converts between neutral mass and precursor m/z.
+                </p>
+            </div>
+
             <p style="margin-top:0.75rem; font-size:0.85rem; color:#6b7280;">
                 Paste one or more MS/MS spectra below. For multiple collision energies,
                 click “Add another spectrum” and select the corresponding NCE (5–100%).
                 The NCE will be converted to absolute eV using the precursor m/z
-                computed from the formula and adduct.
+                determined from your formula or mass and the selected adduct.
             </p>
 
             <div class="row" style="margin-top:0.75rem;">
@@ -4537,7 +4588,7 @@
                     <p style="font-size:0.8rem; color:#6b7280; margin-top:0.25rem;">
                         Uploads an MGF file (multiple features); select which feature to use
                         as the query spectrum below.
-                        Metadata parsing is best-effort — please verify that the formula, adduct,
+                        Metadata parsing is best-effort — please verify that the formula or mass, adduct,
                         and collision energy loaded correctly before running retrieval.
                     </p>
                 </div>
@@ -5023,7 +5074,7 @@ sudo mount -t davfs -o ro https://iceberg-ms.mit.edu/dav/ /mnt/iceberg-atlas</co
     </div>
     </section>
 
-    {% if results and results|length > 0 %}
+    {% if retrieval_data %}
     <section class="tab-panel" data-tab="query">
         <div class="card">
             <h2>Retrieved candidates</h2>
@@ -5036,6 +5087,30 @@ sudo mount -t davfs -o ro https://iceberg-ms.mit.edu/dav/ /mnt/iceberg-atlas</co
                 <br>All NIST'23 structures are excluded to avoid license conflict.
                 {% endif %}
             </p>
+
+            {% set search = retrieval_data.get('search_summary', {}) %}
+            {% if search.get('skipped_empty_blocks', 0) %}
+            <p>Skipped {{ search.skipped_empty_blocks }} experimental collision blocks with no usable peaks after preprocessing.</p>
+            {% endif %}
+            {% if search.get('mode') == 'mass' %}
+            <p>
+                Searched {{ search.mass }} {% if search.mass_type == 'mz' %}m/z{% else %}Da (neutral){% endif %}
+                ± {{ search.ppm|int }} ppm: {{ search.formulas|length }} formulas,
+                {{ search.candidate_count }} candidate structures; {{ search.ranked_count }} ranked.
+                Showing the top {{ results|length }}.
+            </p>
+            {% if search.formulas %}
+            <details style="margin-bottom:0.75rem;">
+                <summary>Matching atlas formulas</summary>
+                <p>{{ search.formulas|join(', ') }}</p>
+            </details>
+            {% else %}
+            <p>No atlas formulas match this mass window.</p>
+            {% endif %}
+            {% endif %}
+            {% if not results and (search.get('mode') != 'mass' or search.get('formulas')) %}
+            <p>No candidates have usable spectra at the selected collision energies.</p>
+            {% endif %}
 
             <div class="results-layout">
                 <div class="results-layout-table">
@@ -5071,6 +5146,7 @@ sudo mount -t davfs -o ro https://iceberg-ms.mit.edu/dav/ /mnt/iceberg-atlas</co
                                         <button type="button"
                                               class="btn btn-secondary"
                                               onclick="viewMirrorPlot(this)"
+                                              data-formula="{{ res.formula }}"
                                               data-smiles="{{ res.smiles }}"
                                               data-ce="{{ res.collision_energy }}"
                                               data-adduct="{{ res.adduct }}">

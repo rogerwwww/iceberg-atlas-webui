@@ -32,9 +32,11 @@ import yaml
 try:
     from .vfs import AtlasVirtualFS, VfsError, normalize_virtual_path
     from .webdav_session import register_session_auth
+    from .mass_search import mass_window, paths_in_mass_window
 except ImportError:  # pragma: no cover - direct execution from webui/
     from vfs import AtlasVirtualFS, VfsError, normalize_virtual_path
     from webdav_session import register_session_auth
+    from mass_search import mass_window, paths_in_mass_window
 
 from ms_pred import common
 from ms_pred.common import MassSpec, CompositeMassSpec
@@ -225,13 +227,15 @@ def prepare_user_spectra(
     adduct: str,
     texts: List[str],
     nces: List[str],
+    precursor_mz: float | None = None,
 ) -> CompositeMassSpec:
     """
     Parse user spectra texts, compute precursor m/z from formula + adduct,
     convert NCE to eV using common.nce_to_ev, and return a mapping:
     {ev_value: MassSpec}.
     """
-    precursor_mz = common.formula_mass(formula) + common.ion2mass[adduct]
+    if precursor_mz is None:
+        precursor_mz = common.formula_mass(formula) + common.ion2mass[adduct]
 
     all_specs: List[MassSpec] = []
 
@@ -833,32 +837,49 @@ def retrieve_candidates(
     stepped_ces: List[str] | None = None,
     progress_cb=None,
     include_nist: bool = False,
+    precursor_mz: float | None = None,
+    candidate_paths: List[Path] | None = None,
+    search_summary: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
     """
-    Perform spectrum retrieval for a given formula and user spectra.
+    Rank all structures from a formula or an explicit set of atlas files.
 
     When `include_nist=True` and MSPRED_ATLAS_DIR_NIST is configured, also
     loads structures from the NIST'23 atlas tree and merges them with the
     public candidates before ranking.
     """
     # Precursor m/z for ignoring precursor peak if requested
-    precursor_mz = common.formula_mass(formula) + common.ion2mass[adduct]
+    if precursor_mz is None:
+        precursor_mz = common.formula_mass(formula) + common.ion2mass[adduct]
     ignore_mass_val = precursor_mz - 1 if ignore_precursor else None
 
     if progress_cb:
         progress_cb("preprocess", 10, "Pre-processing experimental spectrum")
 
     # Process the experimental spectra
+    skipped_blocks = 0
     if isinstance(user_specs, CompositeMassSpec):
-        all_ces = [ce for ce in user_specs.keys()]
+        original_blocks = len(user_specs)
         user_specs.process_spec_file(parentmass=precursor_mz, denoise=apply_denoise)
+        all_ces = list(user_specs.keys())
+        skipped_blocks = original_blocks - len(user_specs)
+        if not all_ces:
+            raise ValueError("All experimental collision blocks are empty after preprocessing and parent-mass filtering.")
     elif isinstance(user_specs, MassSpec):
-        all_ces = [f'{user_specs.collision_energy:.0f}']
         user_specs.process_spec_file(parentmass=precursor_mz, denoise=apply_denoise)
+        if not user_specs.num_peaks:
+            raise ValueError("The experimental spectrum is empty after preprocessing and parent-mass filtering.")
+        all_ces = [f'{user_specs.collision_energy:.0f}']
     else:
         raise TypeError(
             f"user_specs must be CompositeMassSpec or MassSpec, got {type(user_specs)}"
         )
+
+    if stepped_mode:
+        stepped_ces = [str(round_ev(ce)) for ce in (stepped_ces or [])]
+        all_ces = stepped_ces
+    if search_summary is not None:
+        search_summary["skipped_empty_blocks"] = skipped_blocks
 
     if progress_cb:
         progress_cb("preprocess", 100, "Experimental spectrum processed")
@@ -866,23 +887,21 @@ def retrieve_candidates(
     if progress_cb:
         progress_cb("load_mgf", 2, "Loading predicted spectra (.mgf)")
 
-    # Load from public atlas
-    mgf_path = get_mgf_path_for_formula(formula, adduct)
-    lib_grouped = load_library_spectra_grouped(mgf_path, progress_cb, all_ces)
-
-    # Merge NIST atlas (authenticated users only)
-    if include_nist and NIST_MGF_DIR is not None and adduct in NIST_ADDUCT_TO_DIR:
-        nist_subdir = common.get_formula_subdir(formula)
-        nist_mgf_path = NIST_ADDUCT_TO_DIR[adduct] / nist_subdir / f"{formula}.mgf"
-        if nist_mgf_path.exists():
-            try:
-                nist_grouped = load_library_spectra_grouped(nist_mgf_path, None, all_ces)
-                # Merge: public keys take priority on collision; NIST adds new structures
-                for k, v in nist_grouped.items():
-                    if k not in lib_grouped:
-                        lib_grouped[k] = v
-            except Exception:
-                pass  # NIST merge failure is non-fatal
+    if candidate_paths is None:
+        candidate_paths = mgf_paths_for_formula(formula, adduct, include_nist)
+        if not candidate_paths:
+            raise FileNotFoundError(f"No atlas spectra found for formula {formula} / {adduct}.")
+    lib_grouped = {}
+    for file_idx, mgf_path in enumerate(candidate_paths, start=1):
+        grouped = load_library_spectra_grouped(mgf_path, None, all_ces)
+        # Public files are first; their structures take priority on collision.
+        for key, info in grouped.items():
+            lib_grouped.setdefault(key, info)
+        if progress_cb:
+            progress_cb("load_mgf", int(100 * file_idx / len(candidate_paths)),
+                        f"Loaded atlas file {file_idx}/{len(candidate_paths)}")
+    if search_summary is not None:
+        search_summary["candidate_count"] = len(lib_grouped)
 
     if progress_cb:
         progress_cb("load_mgf", 100, f"Loaded {len(lib_grouped)} candidate structures")
@@ -920,6 +939,8 @@ def retrieve_candidates(
 
         else:
             # Original behaviour: user has separate spectra at each CE
+            if not set(lib_specs.keys()).intersection(user_specs.keys()):
+                continue
             final_score, ce_values = lib_specs.entr_sim(
                 user_specs,
                 merge_method="unmerged",
@@ -927,13 +948,14 @@ def retrieve_candidates(
                 return_ce=True,
             )
 
+        if not np.isfinite(final_score):
+            continue
+
         # Collect collision energies for display
         ce_values = sorted(ce_values)
         ce_str = ", ".join(f"{ce:.0f}" for ce in ce_values)
 
-        # Serialize all library spectra (unmerged) for caching on the frontend
-        pred_spectra_payload = serialize_pred_spectra_for_frontend(lib_specs)
-
+        # Retain spectra until the global top-k is known.
         results.append(
             {
                 "similarity": final_score,
@@ -943,7 +965,7 @@ def retrieve_candidates(
                 "inchikey": meta_struct.get("INCHIKEY", ""),
                 "adduct": meta_struct.get("ADDUCT", ""),
                 "collision_energy": ce_str,
-                "pred_spectra": pred_spectra_payload,
+                "_lib_specs": lib_specs,
             }
         )
 
@@ -956,7 +978,13 @@ def retrieve_candidates(
 
     # Sort by similarity descending and take top_k
     results.sort(key=lambda x: x["similarity"], reverse=True)
+    if search_summary is not None:
+        search_summary["ranked_count"] = len(results)
     out = results[:top_k]
+    # Only build mirror-plot payloads for the displayed winners, after ranking
+    # the full pool across all formulas.
+    for hit in out:
+        hit["pred_spectra"] = serialize_pred_spectra_for_frontend(hit.pop("_lib_specs"))
 
     if progress_cb:
         progress_cb("postprocess", 100, f"Finishing...")
@@ -2680,7 +2708,13 @@ def api_retrieve_start():
             # Reconstruct key values from form_data
             formula = (form_data.get("formula", [""])[0] or "").strip()
             adduct = (form_data.get("adduct", ["[M+H]+"])[0] or "[M+H]+").strip()
+            search_mode = form_data.get("search_mode", ["formula"])[0]
+            query_mass = form_data.get("query_mass", [""])[0]
+            mass_type = form_data.get("mass_type", ["mz"])[0]
+            mass_ppm = form_data.get("mass_ppm", ["5"])[0]
             precursor_mz = None
+            candidate_paths = None
+            search_summary = {"mode": search_mode}
 
             spectrum_texts = [s for s in form_data.get("spectrum_text", [])]
             spectrum_nces = [s for s in form_data.get("spectrum_nce", [])]
@@ -2690,13 +2724,30 @@ def api_retrieve_start():
             ignore_precursor = "ignore_precursor" in form_data
             apply_denoise = "apply_denoise" in form_data
 
-            if not formula:
-                raise ValueError("Chemical formula is required.")
-
             if adduct not in common.ion2mass:
                 raise ValueError(
                     f"Unknown adduct: {adduct}. This adduct type is not supported by ICEBERG."
                 )
+
+            if search_mode == "mass":
+                lower, upper, precursor_mz = mass_window(query_mass, mass_ppm, mass_type, adduct)
+                _job_update_progress(job_id, "load_mgf", 0, "Finding atlas formulas in the mass window (first search builds an index)")
+                matches = paths_in_mass_window(ADDUCT_TO_DIR[adduct], lower, upper)
+                if include_nist and adduct in NIST_ADDUCT_TO_DIR:
+                    matches += paths_in_mass_window(NIST_ADDUCT_TO_DIR[adduct], lower, upper)
+                candidate_paths = [path for _, path in matches]
+                search_summary.update(
+                    mass=float(query_mass), mass_type=mass_type, ppm=float(mass_ppm),
+                    formulas=sorted({f for f, _ in matches}),
+                )
+                # A stale or supplied formula never restricts a mass-mode search.
+                formula = ""
+            elif search_mode == "formula":
+                if not formula:
+                    raise ValueError("Chemical formula is required.")
+                precursor_mz = common.formula_mass(formula) + common.ion2mass[adduct]
+            else:
+                raise ValueError("Search mode must be formula or mass.")
 
             # Spectra from text areas (these include anything populated from .ms)
             has_nonempty_text = any(t.strip() for t in spectrum_texts)
@@ -2742,8 +2793,7 @@ def api_retrieve_start():
                 except Exception:
                     base_nce = 30.0
 
-                if formula and adduct in common.ion2mass:
-                    precursor_mz = common.formula_mass(formula) + common.ion2mass[adduct]
+                if precursor_mz is not None:
                     try:
                         ce_val = float(common.nce_to_ev(base_nce, precursor_mz))
                     except Exception:
@@ -2799,6 +2849,7 @@ def api_retrieve_start():
                     adduct=adduct,
                     texts=spectrum_texts,
                     nces=spectrum_nces,
+                    precursor_mz=precursor_mz,
                 )
                 stepped_mode = False
                 stepped_ces = None
@@ -2822,6 +2873,9 @@ def api_retrieve_start():
                 stepped_ces=stepped_ces,
                 progress_cb=pcb,
                 include_nist=include_nist,
+                precursor_mz=precursor_mz,
+                candidate_paths=candidate_paths,
+                search_summary=search_summary,
             )
 
             # Build retrieval_data for mirror plots
@@ -2831,6 +2885,7 @@ def api_retrieve_start():
                 "hits": hits,
                 "stepped_mode": stepped_mode,
                 "warning_msg": None,
+                "search_summary": search_summary,
             }
 
             # Also store enough to re-render input blocks (preloaded_spectra)
@@ -2858,6 +2913,10 @@ def api_retrieve_start():
             ctx = {
                 "results": hits,
                 "formula": formula,
+                "search_mode": search_mode,
+                "query_mass": query_mass,
+                "mass_type": mass_type,
+                "mass_ppm": float(mass_ppm) if search_mode == "mass" else 5,
                 "adduct": adduct,
                 "preloaded_spectra": preloaded_spectra,
                 "retrieval_data": retrieval_data,
@@ -2911,6 +2970,10 @@ def retrieval_result(job_id: str):
         "index.html",
         results=ctx["results"],
         formula=ctx["formula"],
+        search_mode=ctx.get("search_mode", "formula"),
+        query_mass=ctx.get("query_mass", ""),
+        mass_type=ctx.get("mass_type", "mz"),
+        mass_ppm=ctx.get("mass_ppm", 5),
         adduct=ctx["adduct"],
         preloaded_spectra=ctx["preloaded_spectra"],
         retrieval_data=ctx["retrieval_data"],

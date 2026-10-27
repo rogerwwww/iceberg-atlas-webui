@@ -4,6 +4,46 @@ Standalone Flask application for ICEBERG Atlas spectrum retrieval and visualizat
 
 This application is built with Flask and should be served in production using **Gunicorn behind NGINX**.
 
+## Spectrum retrieval
+
+Under **Query spectra**, choose **Chemical formula** (the default) or **Mass ± ppm**.
+Mass search requires no formula: enter a precursor m/z or a neutral monoisotopic
+mass and select **3, 5 (default), 10, or 20 ppm**. Select the correct `[M+H]+` or
+`[M-H]-` adduct. The tolerance is relative to the entered value; precursor m/z
+is converted to neutral mass using the backend's adduct mass shift.
+
+Every formula within the inclusive window that has spectra in the configured
+atlas is included. All eligible structures across those formulas are ranked
+together by the existing entropy similarity, with the top 50 displayed.
+Collision-energy matching and spectrum preprocessing use the entered precursor
+m/z (or the precursor m/z calculated from neutral mass). MGF uploads populate
+the mass field from `PEPMASS`. Results report the matched formulas and candidate
+counts, including empty searches. NIST formulas and spectra remain restricted to
+users with NIST access.
+
+This searches the PubChem-derived **atlas contents**, rather than making live
+PubChem requests or predicting formulas. Compounds without atlas predictions
+cannot be scored.
+
+Mass lookup builds a SQLite formula/mass index from MGF filenames on first use,
+separately for each atlas/adduct directory. Only the small index is cached;
+atlas files are read in place. Builds are locked across workers and published
+atomically. A snapshot is reused for up to 24 hours; the next search refreshes
+an older snapshot. The first build can take time on a large atlas. Set
+`ICEBERG_MASS_INDEX_DIR` to an absolute, writable cache directory owned by the
+WebUI service user (default: `/tmp/iceberg-mass-index-<uid>`). Keep it private
+and outside the atlas tree and Git.
+
+After adding/removing formula files, refresh the index before serving searches.
+You can also prebuild it before first use, using the same environment and service
+user as Gunicorn. For example (replace paths with your atlas locations):
+
+```bash
+conda run -n ms-gen python -m webui.mass_search /data/atlas/h_plus_out_mgf /data/atlas/h_minus_out_mgf
+```
+
+Run the same command for the gated NIST adduct directories when configured.
+
 ---
 
 ## Deployment Overview
