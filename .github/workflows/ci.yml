@@ -2,7 +2,7 @@ name: tests
 on: [push, pull_request, workflow_dispatch]
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -10,9 +10,7 @@ jobs:
           repository: coleygroup/ms-pred
           path: backend
       - uses: astral-sh/setup-uv@v3
-        with:
-          python-version: '3.12'
       - run: sudo apt-get update && sudo apt-get install -y libcairo2 libxrender1 libglib2.0-0
-      - run: uv sync --project backend --extra cpu
+      - run: uv sync --project backend --extra cpu --python 3.12
       - run: uv pip install --python backend/.venv/bin/python -e '.[test,studies]'
       - run: backend/.venv/bin/python -m pytest -q
