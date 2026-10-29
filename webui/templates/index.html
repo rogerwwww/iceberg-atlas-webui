@@ -1098,6 +1098,14 @@
 
                 outLines.push(`Name: ${nameVal}`);
                 outLines.push(`PrecursorMZ: ${precursorMz}`);
+                if (params["ADDUCT"]) {
+                    outLines.push(`Precursor_type: ${params["ADDUCT"]}`);
+                    if (params["ADDUCT"].endsWith("+")) {
+                        outLines.push("Ion_mode: P");
+                    } else if (params["ADDUCT"].endsWith("-")) {
+                        outLines.push("Ion_mode: N");
+                    }
+                }
                 if (params["SMILES"]) {
                     outLines.push(`SMILES: ${params["SMILES"]}`);
                 }
@@ -1127,7 +1135,9 @@
                 alert("Please enter a chemical formula.");
                 return;
             }
-            const url = downloadBaseUrl + "?formula=" + encodeURIComponent(formula);
+            const adduct = document.getElementById("download-adduct").value;
+            const url = downloadBaseUrl + "?formula=" + encodeURIComponent(formula)
+                + "&adduct=" + encodeURIComponent(adduct);
             // Let the browser handle the download normally
             window.location.href = url;
         }
@@ -1140,7 +1150,9 @@
                 return;
             }
 
-            const url = downloadBaseUrl + "?formula=" + encodeURIComponent(formula);
+            const adduct = document.getElementById("download-adduct").value;
+            const url = downloadBaseUrl + "?formula=" + encodeURIComponent(formula)
+                + "&adduct=" + encodeURIComponent(adduct);
 
             fetch(url)
                 .then(resp => {
@@ -5023,7 +5035,7 @@
     <div class="card">
         <h2>Download predicted spectra (.mgf / .msp)</h2>
         <p style="font-size:0.85rem; color:#6b7280;">
-            Download ICEBERG-predicted spectra for a specific PubChem formula from the atlas.
+            Download ICEBERG-predicted spectra for a specific PubChem formula and selected adduct from the atlas.
             You can either download the raw MGF only, or download MGF and a converted MSP file.<br>
             {% if current_user.is_authenticated and current_user.can_access_nist %}
             NIST'23 structures are included in the download.
@@ -5062,6 +5074,13 @@ sudo mount -t davfs -o ro https://iceberg-ms.mit.edu/dav/ /mnt/iceberg-atlas</co
             <div>
                 <label for="download-formula">Chemical formula</label>
                 <input type="text" id="download-formula" name="formula" placeholder="e.g. CH9N3O9S4">
+            </div>
+            <div>
+                <label for="download-adduct">Adduct / ion mode</label>
+                <select id="download-adduct" name="adduct">
+                    <option value="[M+H]+" selected>[M+H]+ (Positive)</option>
+                    <option value="[M-H]-">[M-H]- (Negative)</option>
+                </select>
             </div>
             <div style="align-self:flex-end; display:flex; gap:0.5rem; flex-wrap:wrap;">
                 <button type="button"
